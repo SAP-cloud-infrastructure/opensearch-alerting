@@ -471,7 +471,7 @@ class AlertService(
         trigger: BucketLevelTrigger,
         currentAlerts: MutableMap<String, Alert>,
         aggResultBuckets: List<AggregationResultBucket>,
-        findings: List<String>,
+        findings: Map<String, List<String>>,
         executionId: String,
         workflorwRunContext: WorkflowRunContext?
     ): Map<AlertCategory, List<Alert>> {
@@ -488,7 +488,11 @@ class AlertService(
                 // Remove de-duped Alert from currentAlerts since it is no longer a candidate for a potentially completed Alert
                 currentAlerts.remove(aggAlertBucket.getBucketKeysHash())
             } else {
-                // New Alert
+                // New Alert — assign only the finding IDs that belong to this specific bucket key.
+                // Fall back to the full findings list (flattened) when per-bucket mapping is absent.
+                val bucketKey = aggAlertBucket.getBucketKeysHash()
+                val bucketFindingIds = findings[bucketKey]
+                    ?: findings.values.flatten()
                 val alertState = if (workflorwRunContext?.auditDelegateMonitorAlerts == true) {
                     Alert.State.AUDIT
                 } else Alert.State.ACTIVE
@@ -497,7 +501,7 @@ class AlertService(
                     lastNotificationTime = currentTime, state = alertState, errorMessage = null,
                     errorHistory = mutableListOf(), actionExecutionResults = mutableListOf(),
                     schemaVersion = IndexUtils.alertIndexSchemaVersion, aggregationResultBucket = aggAlertBucket,
-                    findingIds = findings, executionId = executionId, workflowId = workflorwRunContext?.workflowId ?: ""
+                    findingIds = bucketFindingIds, executionId = executionId, workflowId = workflorwRunContext?.workflowId ?: ""
                 )
                 newAlerts.add(newAlert)
             }
