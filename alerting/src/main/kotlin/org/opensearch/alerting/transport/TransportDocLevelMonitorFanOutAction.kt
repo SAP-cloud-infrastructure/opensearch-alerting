@@ -476,6 +476,7 @@ class TransportDocLevelMonitorFanOutAction
                 composedAlert.copy(
                     id = existingAlert.id,
                     startTime = existingAlert.startTime,
+                    state = existingAlert.state,
                     findingIds = mergedFindingIds,
                     relatedDocIds = mergedRelatedDocIds
                 )
