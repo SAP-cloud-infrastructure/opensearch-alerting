@@ -477,6 +477,7 @@ class TransportDocLevelMonitorFanOutAction
                     id = existingAlert.id,
                     startTime = existingAlert.startTime,
                     state = existingAlert.state,
+                    acknowledgedTime = existingAlert.acknowledgedTime,
                     findingIds = mergedFindingIds,
                     relatedDocIds = mergedRelatedDocIds
                 )
