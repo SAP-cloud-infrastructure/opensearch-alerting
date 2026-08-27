@@ -132,6 +132,17 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
                     sanitizeFieldMappingAttributes(it[TYPE] as? String, it)
                 }
             }
+
+            // Recurse into sub-properties of object/implicit-object fields so that analysis
+            // attributes on nested leaves are stripped before the PutMappingRequest is issued.
+            if (fieldType == null || fieldType == "object" || fieldType == NESTED) {
+                @Suppress("UNCHECKED_CAST")
+                (mapping[PROPERTIES] as? Map<*, *>)?.forEach { (_, subMapping) ->
+                    (subMapping as? MutableMap<String, Any>)?.let {
+                        sanitizeFieldMappingAttributes(it[TYPE] as? String, it)
+                    }
+                }
+            }
         }
     }
 
