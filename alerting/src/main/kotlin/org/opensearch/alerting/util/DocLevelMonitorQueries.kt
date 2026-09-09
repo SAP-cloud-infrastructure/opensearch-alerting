@@ -308,8 +308,11 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
                 val (oldName, newName, props) = processLeafFn(it.key, fullPath, (it.value as Map<String, Any>).toMutableMap())
                 newNodes.add(Triple(oldName, newName, props))
             } else if (nodeProps.containsKey(PROPERTIES) && nodeProps[PROPERTIES] != null) {
-                // Internal(non-leaf) node - visit children
-                traverseMappingsAndUpdate((nodeProps[PROPERTIES] as Map<String, Any>).toMutableMap(), fullPath, processLeafFn, flattenPaths)
+                // Internal(non-leaf) node - visit children.
+                // Must pass the live MutableMap (not a copy) so that leaf renames and sanitization
+                // performed inside the recursive call are visible in the parent's properties map.
+                @Suppress("UNCHECKED_CAST")
+                traverseMappingsAndUpdate(nodeProps[PROPERTIES] as MutableMap<String, Any>, fullPath, processLeafFn, flattenPaths)
             }
         }
         // Here we can update all processed leaves in tree
