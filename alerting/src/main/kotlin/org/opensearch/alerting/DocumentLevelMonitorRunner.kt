@@ -155,21 +155,12 @@ class DocumentLevelMonitorRunner : MonitorRunner() {
                     monitorCtx.clusterService!!,
                     monitorCtx.indexNameExpressionResolver!!
                 )
-                var lastWriteIndex: String? = null
-                if (IndexUtils.isAlias(indexName, monitorCtx.clusterService!!.state()) ||
-                    IndexUtils.isDataStream(indexName, monitorCtx.clusterService!!.state())
-                ) {
-                    lastWriteIndex = concreteIndices.find { lastRunContext.containsKey(it) }
-                    if (lastWriteIndex != null) {
-                        val lastWriteIndexCreationDate =
-                            IndexUtils.getCreationDateForIndex(lastWriteIndex, monitorCtx.clusterService!!.state())
-                        concreteIndices = IndexUtils.getNewestIndicesByCreationDate(
-                            concreteIndices,
-                            monitorCtx.clusterService!!.state(),
-                            lastWriteIndexCreationDate
-                        )
-                    }
-                }
+                // All concrete backing indices are scanned on every run. Seq_no watermarks
+                // ensure only documents added since the previous run are processed; sealed
+                // pre-rollover indices produce empty fan-outs at negligible cost. Any filter
+                // based on creation dates or write-index designation introduces assumptions
+                // (millisecond-precision timestamps, exclusive alias routing, ILM policy
+                // configuration) that cannot be safely enforced in the general case.
                 concreteIndicesSeenSoFar.addAll(concreteIndices)
                 val updatedIndexName = indexName.replace("*", "_")
                 updatedIndexNames.add(updatedIndexName)
@@ -196,20 +187,7 @@ class DocumentLevelMonitorRunner : MonitorRunner() {
                         concreteIndexName,
                         shardCount
                     )
-                    if (IndexUtils.isAlias(indexName, monitorCtx.clusterService!!.state()) ||
-                        IndexUtils.isDataStream(indexName, monitorCtx.clusterService!!.state())
-                    ) {
-                        if (concreteIndexName == IndexUtils.getWriteIndex(
-                                indexName,
-                                monitorCtx.clusterService!!.state()
-                            )
-                        ) {
-                            updatedLastRunContext.remove(lastWriteIndex)
-                            updatedLastRunContext[concreteIndexName] = indexUpdatedRunContext
-                        }
-                    } else {
-                        updatedLastRunContext[concreteIndexName] = indexUpdatedRunContext
-                    }
+                    updatedLastRunContext[concreteIndexName] = indexUpdatedRunContext
 
                     val count: Int = indexLastRunContext["shards_count"] as Int
                     for (i: Int in 0 until count) {
