@@ -131,7 +131,17 @@ class TransportGetMonitorAction @Inject constructor(
                             xContentRegistry, LoggingDeprecationHandler.INSTANCE,
                             getResponse.sourceAsBytesRef, XContentType.JSON
                         ).use { xcp ->
-                            monitor = ScheduledJob.parse(xcp, getResponse.id, getResponse.version) as Monitor
+                            val scheduledJob = ScheduledJob.parse(xcp, getResponse.id, getResponse.version)
+                            if (scheduledJob !is Monitor) {
+                                actionListener.onFailure(
+                                    AlertingException(
+                                        "Monitor not found.", RestStatus.NOT_FOUND,
+                                        OpenSearchStatusException("Monitor not found.", RestStatus.NOT_FOUND)
+                                    )
+                                )
+                                return@whenComplete
+                            }
+                            monitor = scheduledJob
                         }
                     }
                     // when resource sharing is enabled, security plugin gates access at the index layer

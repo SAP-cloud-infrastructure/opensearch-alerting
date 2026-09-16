@@ -9,7 +9,14 @@ import org.opensearch.alerting.AlertingPlugin
 import org.opensearch.alerting.util.context
 import org.opensearch.commons.alerting.action.AlertingActions
 import org.opensearch.commons.alerting.action.GetMonitorRequest
+import org.opensearch.commons.alerting.action.GetMonitorResponse
+import org.opensearch.commons.alerting.action.GetWorkflowRequest
+import org.opensearch.commons.alerting.action.GetWorkflowResponse
+import org.opensearch.commons.alerting.util.AlertingException
+import org.opensearch.core.action.ActionListener
+import org.opensearch.core.rest.RestStatus
 import org.opensearch.rest.BaseRestHandler
+import org.opensearch.rest.BytesRestResponse
 import org.opensearch.rest.BaseRestHandler.RestChannelConsumer
 import org.opensearch.rest.RestHandler.ReplacedRoute
 import org.opensearch.rest.RestHandler.Route
@@ -67,9 +74,52 @@ class RestGetMonitorAction : BaseRestHandler() {
             srcContext = FetchSourceContext.DO_NOT_FETCH_SOURCE
         }
         val getMonitorRequest = GetMonitorRequest(monitorId, RestActions.parseVersion(request), request.method(), srcContext)
-        return RestChannelConsumer {
-                channel ->
-            client.execute(AlertingActions.GET_MONITOR_ACTION_TYPE, getMonitorRequest, RestToXContentListener(channel))
+        return RestChannelConsumer { channel ->
+            client.execute(
+                AlertingActions.GET_MONITOR_ACTION_TYPE,
+                getMonitorRequest,
+                object : ActionListener<GetMonitorResponse> {
+                    override fun onResponse(response: GetMonitorResponse) {
+                        RestToXContentListener<GetMonitorResponse>(channel).onResponse(response)
+                    }
+
+                    override fun onFailure(e: Exception) {
+                        val status = (e as? AlertingException)?.status()
+                            ?: (e.cause as? org.opensearch.OpenSearchStatusException)?.status()
+                        if (status == RestStatus.NOT_FOUND) {
+                            // Document exists as a Workflow; fetch it and embed under "monitor" key
+                            // so the Dashboards backend (which checks for that key) can render it
+                            val getWorkflowRequest = GetWorkflowRequest(monitorId, request.method())
+                            client.execute(
+                                AlertingActions.GET_WORKFLOW_ACTION_TYPE,
+                                getWorkflowRequest,
+                                object : ActionListener<GetWorkflowResponse> {
+                                    override fun onResponse(wfResp: GetWorkflowResponse) {
+                                        try {
+                                            val builder = channel.newBuilder()
+                                            builder.startObject()
+                                            builder.field("_id", wfResp.id)
+                                            builder.field("_version", wfResp.version)
+                                            builder.field("_seq_no", wfResp.seqNo)
+                                            builder.field("_primary_term", wfResp.primaryTerm)
+                                            wfResp.workflow?.let { builder.field("monitor", it) }
+                                            builder.endObject()
+                                            channel.sendResponse(BytesRestResponse(RestStatus.OK, builder))
+                                        } catch (ex: Exception) {
+                                            RestToXContentListener<GetMonitorResponse>(channel).onFailure(ex)
+                                        }
+                                    }
+                                    override fun onFailure(ex: Exception) {
+                                        RestToXContentListener<GetMonitorResponse>(channel).onFailure(ex)
+                                    }
+                                }
+                            )
+                        } else {
+                            RestToXContentListener<GetMonitorResponse>(channel).onFailure(e)
+                        }
+                    }
+                }
+            )
         }
     }
 }
