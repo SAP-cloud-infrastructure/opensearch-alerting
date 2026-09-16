@@ -466,8 +466,11 @@ object MonitorRunnerService : JobRunner, CoroutineScope, AbstractLifecycleCompon
         }
 
         if (job is Workflow) {
-            logger.info("Executing scheduled workflow - id: ${job.id}, periodStart: $periodStart, periodEnd: $periodEnd, dryrun: $dryrun")
-            CompositeWorkflowRunner.runWorkflow(workflow = job, monitorCtx, periodStart, periodEnd, dryrun, transportService)
+            throw AlertingException(
+                "Workflow ${job.id} cannot be executed via the monitor endpoint; use the workflow execute endpoint.",
+                RestStatus.BAD_REQUEST,
+                IllegalArgumentException("Expected Monitor, received Workflow")
+            )
         }
         val monitor = job as Monitor
         val executionId = "${monitor.id}_${LocalDateTime.now(ZoneOffset.UTC)}_${UUID.randomUUID()}"
