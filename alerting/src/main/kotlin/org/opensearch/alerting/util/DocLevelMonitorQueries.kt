@@ -56,6 +56,10 @@ import kotlin.coroutines.suspendCoroutine
 
 private val log = LogManager.getLogger(DocLevelMonitorQueries::class.java)
 
+/**
+ * Manages doc-level query index lifecycle: creation, mapping updates, rollover, and field-limit adjustment.
+ * `open` for test isolation only — not designed as a production extension point.
+ */
 open class DocLevelMonitorQueries(private val client: Client, private val clusterService: ClusterService) {
     companion object {
 
@@ -597,10 +601,8 @@ open class DocLevelMonitorQueries(private val client: Client, private val cluste
                     monitor.deleteQueryIndexInEveryRun == true
                 )
         ) {
-            // queryIndex is alias; its backing concrete index is the write index.
-            // The == guard handles the backwards-compat case where the alias name was mistakenly stored
-            // in metadata. Using != (the old code) caused this branch to fire on every run because
-            // the stored concrete index (e.g. "...-000001") always differs from the alias name.
+            // Fix: old != caused churn — a concrete index always differs from the alias, so the branch
+            // fired every run. == also catches the rare case where the alias name itself was persisted.
             targetQueryIndex = getWriteIndexNameForAlias(monitor.dataSources.queryIndex)
             if (targetQueryIndex == null) {
                 val message = "Failed to get write index for queryIndex alias:${monitor.dataSources.queryIndex}"
@@ -846,36 +848,3 @@ open class DocLevelMonitorQueries(private val client: Client, private val cluste
                 )
             }
             if (!updateSettingsResponse.isAcknowledged) {
-                log.warn(
-                    "Field mapping limit settings update was not acknowledged for query index [$concreteQueryIndex]. " +
-                        "The index may still have the old limit of $queryIndexLimit."
-                )
-            }
-        }
-    }
-
-    private suspend fun rolloverQueryIndex(monitor: Monitor): String {
-        val queryIndex = monitor.dataSources.queryIndex
-        val queryIndexPattern = monitor.dataSources.queryIndex + INDEX_PATTERN_SUFFIX
-
-        val request = RolloverRequest(queryIndex, null)
-        request.createIndexRequest.index(queryIndexPattern)
-            .mapping(docLevelQueriesMappings())
-            .settings(docLevelQueriesSettings())
-        val response: RolloverResponse = client.suspendUntil {
-            client.admin().indices().rolloverIndex(request, it)
-        }
-        if (response.isRolledOver == false) {
-            val message = "failed to rollover queryIndex:$queryIndex queryIndexPattern:$queryIndexPattern"
-            log.error(message)
-            throw AlertingException.wrap(
-                OpenSearchStatusException(message, RestStatus.INTERNAL_SERVER_ERROR)
-            )
-        }
-        return response.newIndex
-    }
-
-    internal open fun getWriteIndexNameForAlias(alias: String): String? {
-        return this.clusterService.state().metadata().indicesLookup?.get(alias)?.writeIndex?.index?.name
-    }
-}

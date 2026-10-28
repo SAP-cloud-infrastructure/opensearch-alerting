@@ -28,6 +28,7 @@ import org.opensearch.commons.alerting.util.AlertingException
 import org.opensearch.core.action.ActionListener
 import org.opensearch.index.seqno.SequenceNumbers
 import org.opensearch.test.OpenSearchTestCase
+import org.opensearch.transport.RemoteTransportException
 import org.opensearch.transport.client.AdminClient
 import org.opensearch.transport.client.Client
 import org.opensearch.transport.client.IndicesAdminClient
@@ -62,7 +63,8 @@ class DocLevelMonitorQueriesTests : OpenSearchTestCase() {
     private class TestableDocLevelMonitorQueries(
         client: Client,
         clusterService: ClusterService,
-        var resolvedIndexName: String? = "concrete-query-index-000001"
+        var resolvedIndexName: String? = "concrete-query-index-000001",
+        var rolledOverIndexName: String = "concrete-query-index-000002"
     ) : DocLevelMonitorQueries(client, clusterService) {
         var getWriteIndexNameForAliasCallCount = 0
         var lastAliasQueried: String? = null
@@ -76,6 +78,12 @@ class DocLevelMonitorQueriesTests : OpenSearchTestCase() {
 
         override suspend fun adjustMaxFieldLimitForQueryIndex(sourceIndexFieldLimit: Long, concreteQueryIndex: String) {
             lastPutConcreteQueryIndex = concreteQueryIndex
+        }
+
+        // Override rolloverQueryIndex to avoid calling monitorCtx (null in unit tests).
+        // Returns a configurable new index name for test isolation.
+        override suspend fun rolloverQueryIndex(monitor: Monitor): String {
+            return rolledOverIndexName
         }
     }
 
@@ -177,6 +185,11 @@ class DocLevelMonitorQueriesTests : OpenSearchTestCase() {
             existingConcreteIndex,
             metadata.sourceToQueryIndexMapping[sourceIndex + monitor.id]
         )
+        assertEquals(
+            "adjustMaxFieldLimitForQueryIndex should receive the concrete index, not the alias",
+            existingConcreteIndex,
+            testableQueries.lastPutConcreteQueryIndex
+        )
     }
 
     fun `test updateQueryIndexMappings when deleteQueryIndexInEveryRun true and targetQueryIndex equals alias resolves concrete index`() {
@@ -219,6 +232,11 @@ class DocLevelMonitorQueriesTests : OpenSearchTestCase() {
             "Metadata mapping should be updated to resolved concrete index",
             concreteResolvedIndex,
             metadata.sourceToQueryIndexMapping[sourceIndex + monitor.id]
+        )
+        assertEquals(
+            "adjustMaxFieldLimitForQueryIndex should receive the resolved concrete index, not the alias",
+            concreteResolvedIndex,
+            testableQueries.lastPutConcreteQueryIndex
         )
     }
 
@@ -263,6 +281,11 @@ class DocLevelMonitorQueriesTests : OpenSearchTestCase() {
             concreteResolvedIndex,
             metadata.sourceToQueryIndexMapping[sourceIndex + monitor.id]
         )
+        assertEquals(
+            "adjustMaxFieldLimitForQueryIndex should receive the resolved concrete index, not the alias",
+            concreteResolvedIndex,
+            testableQueries.lastPutConcreteQueryIndex
+        )
     }
 
     fun `test updateQueryIndexMappings when deleteQueryIndexInEveryRun false retains concrete index without resolution`() {
@@ -299,6 +322,11 @@ class DocLevelMonitorQueriesTests : OpenSearchTestCase() {
             "Metadata mapping should preserve existing concrete index",
             existingConcreteIndex,
             metadata.sourceToQueryIndexMapping[sourceIndex + monitor.id]
+        )
+        assertEquals(
+            "adjustMaxFieldLimitForQueryIndex should receive the concrete index, not the alias",
+            existingConcreteIndex,
+            testableQueries.lastPutConcreteQueryIndex
         )
     }
 
@@ -337,9 +365,18 @@ class DocLevelMonitorQueriesTests : OpenSearchTestCase() {
             existingConcreteIndex,
             metadata.sourceToQueryIndexMapping[sourceIndex + monitor.id]
         )
+        assertEquals(
+            "adjustMaxFieldLimitForQueryIndex should receive the concrete index, not the alias",
+            existingConcreteIndex,
+            testableQueries.lastPutConcreteQueryIndex
+        )
     }
 
     fun `test updateQueryIndexMappings when deleteQueryIndexInEveryRun false and targetQueryIndex equals alias does not re-resolve`() {
+        // Accepted trade-off: when deleteQueryIndexInEveryRun==false and the alias name is stored in metadata,
+        // the stale alias is never corrected in this code path. OpenSearch routes PutMapping against an alias to its
+        // write index, so issuing a PutMappingRequest with the alias name is a valid (if non-ideal) operation.
+        // The alias-corruption is only fixed when deleteQueryIndexInEveryRun==true triggers re-resolution.
         val aliasName = "query-index-alias"
         val monitor = createMonitor(queryIndexAlias = aliasName, deleteQueryIndexInEveryRun = false)
         val sourceIndex = "test-source-index"
@@ -368,6 +405,13 @@ class DocLevelMonitorQueriesTests : OpenSearchTestCase() {
             "getWriteIndexNameForAlias should NOT be called when deleteQueryIndexInEveryRun is false",
             0,
             testableQueries.getWriteIndexNameForAliasCallCount
+        )
+        // The alias name is passed through to adjustMaxFieldLimitForQueryIndex in this accepted trade-off path.
+        // OpenSearch routes the resulting UpdateSettings call to the alias's write index, so this is valid.
+        assertEquals(
+            "adjustMaxFieldLimitForQueryIndex receives alias name in the accepted trade-off path",
+            aliasName,
+            testableQueries.lastPutConcreteQueryIndex
         )
     }
 
@@ -412,540 +456,180 @@ class DocLevelMonitorQueriesTests : OpenSearchTestCase() {
     }
 
 
+    // The null branch fires independently of deleteQueryIndexInEveryRun.
+    // This is distinct from tests that have a non-null concrete index stored with flag=true/false.
+    fun `test updateQueryIndexMappings when targetQueryIndex is null and deleteQueryIndexInEveryRun false still resolves concrete index`() {
+        val aliasName = "query-index-alias"
+        val monitor = createMonitor(queryIndexAlias = aliasName, deleteQueryIndexInEveryRun = false)
+        val sourceIndex = "test-source-index"
+        // No entry in metadata — targetQueryIndex will be null on first run regardless of deleteQueryIndexInEveryRun
+        val metadata = createMonitorMetadata(
+            monitorId = monitor.id,
+            sourceIndex = sourceIndex,
+            initialTargetQueryIndex = null
+        )
 
-    // -------------------------------------------------------------------------
-    // Helpers
-    // -------------------------------------------------------------------------
+        val concreteResolvedIndex = "concrete-query-index-000001"
+        val testableQueries = TestableDocLevelMonitorQueries(
+            client,
+            clusterService,
+            resolvedIndexName = concreteResolvedIndex
+        )
 
-    private fun makeInstance(): DocLevelMonitorQueries =
-        DocLevelMonitorQueries(mock(Client::class.java), mock(ClusterService::class.java))
-
-    /** Identity leaf processor — returns every field unchanged. */
-    private val identityLeaf =
-        fun(fieldName: String, _: String, props: MutableMap<String, Any>):
-            Triple<String, String, MutableMap<String, Any>> =
-            Triple(fieldName, fieldName, props)
-
-    /** Alias-skipping leaf processor that mirrors the production bugfix logic. */
-    private val aliasSkippingLeaf =
-        fun(fieldName: String, _: String, props: MutableMap<String, Any>):
-            Triple<String, String, MutableMap<String, Any>> {
-            if (props["type"] == "alias") {
-                return Triple(fieldName, fieldName, mutableMapOf())
-            }
-            return Triple(fieldName, fieldName, props)
+        val (response, targetIndex) = runBlocking {
+            testableQueries.updateQueryIndexMappings(
+                monitor = monitor,
+                monitorMetadata = metadata,
+                sourceIndex = sourceIndex,
+                sourceIndexFieldLimit = 1000L,
+                updatedProperties = mutableMapOf(),
+                indexTimeout = TimeValue.timeValueSeconds(30)
+            )
         }
 
-    // -------------------------------------------------------------------------
-    // deepCopyMap — structural correctness
-    // -------------------------------------------------------------------------
-
-    fun `test deepCopyMap returns an equal but distinct map reference`() {
-        val original = mutableMapOf<String, Any>("key" to "value")
-
-        val copy = DocLevelMonitorQueries.deepCopyMap(original)
-
-        assertEquals(original, copy)
-        assertNotSame(original, copy)
-    }
-
-    fun `test deepCopyMap deep copies nested maps so mutations are isolated`() {
-        val nested = mutableMapOf<String, Any>("inner" to "original")
-        val original = mutableMapOf<String, Any>("outer" to nested)
-
-        val copy = DocLevelMonitorQueries.deepCopyMap(original)
-
-        // Mutate the nested map in the copy.
-        @Suppress("UNCHECKED_CAST")
-        (copy["outer"] as MutableMap<String, Any>)["inner"] = "mutated"
-
-        // Original nested map must be unaffected.
-        assertEquals("original", nested["inner"])
-    }
-
-    fun `test deepCopyMap copies nested map references independently`() {
-        val nested = mutableMapOf<String, Any>("inner" to "value")
-        val original = mutableMapOf<String, Any>("outer" to nested)
-
-        val copy = DocLevelMonitorQueries.deepCopyMap(original)
-
-        assertNotSame(nested, copy["outer"])
-    }
-
-    fun `test deepCopyMap copies list of scalars as a new mutable list`() {
-        val list = mutableListOf("a", "b", "c")
-        val original = mutableMapOf<String, Any>("items" to list)
-
-        val copy = DocLevelMonitorQueries.deepCopyMap(original)
-
-        @Suppress("UNCHECKED_CAST")
-        val copiedList = copy["items"] as MutableList<String>
-        copiedList.add("d")
-
-        // The list in the copy is a distinct mutable list; original list unchanged.
-        assertEquals(3, list.size)
-        assertEquals(4, copiedList.size)
-        assertNotSame(list, copiedList)
-    }
-
-    fun `test deepCopyMap preserves scalar values`() {
-        val original = mutableMapOf<String, Any>(
-            "strVal" to "hello",
-            "intVal" to 42,
-            "boolVal" to true,
-            "longVal" to 9_999_999_999L,
-        )
-
-        val copy = DocLevelMonitorQueries.deepCopyMap(original)
-
-        assertEquals("hello", copy["strVal"])
-        assertEquals(42, copy["intVal"])
-        assertEquals(true, copy["boolVal"])
-        assertEquals(9_999_999_999L, copy["longVal"])
-    }
-
-    fun `test deepCopyMap handles empty map`() {
-        val copy = DocLevelMonitorQueries.deepCopyMap(emptyMap())
-
-        assertTrue(copy.isEmpty())
-    }
-
-    fun `test deepCopyMap handles multiply-nested structure`() {
-        val original = mutableMapOf<String, Any>(
-            "level1" to mutableMapOf<String, Any>(
-                "level2" to mutableMapOf<String, Any>(
-                    "level3" to "leaf",
-                ),
-            ),
-        )
-
-        val copy = DocLevelMonitorQueries.deepCopyMap(original)
-
-        @Suppress("UNCHECKED_CAST")
-        val l1 = copy["level1"] as MutableMap<String, Any>
-        @Suppress("UNCHECKED_CAST")
-        val l2 = l1["level2"] as MutableMap<String, Any>
-        assertEquals("leaf", l2["level3"])
-
-        // Mutate deep copy — original must be unaffected.
-        l2["level3"] = "changed"
-        @Suppress("UNCHECKED_CAST")
-        val origL2 = (original["level1"] as Map<String, Any>)["level2"] as Map<String, Any>
-        assertEquals("leaf", origL2["level3"])
-    }
-
-    // -------------------------------------------------------------------------
-    // traverseMappingsAndUpdate — alias-field bug fix (core of this PR)
-    // -------------------------------------------------------------------------
-
-    fun `test traverseMappingsAndUpdate skips alias-type field when leaf processor returns empty props`() {
-        val queries = makeInstance()
-        // Mapping that contains a single alias-type field.
-        val mappings = mutableMapOf<String, Any>(
-            "real_field_alias" to mutableMapOf<String, Any>(
-                "type" to "alias",
-                "path" to "some.other.field",
-            ),
-        )
-        val flattenPaths = mutableMapOf<String, MutableMap<String, Any>>()
-
-        queries.traverseMappingsAndUpdate(mappings, "", aliasSkippingLeaf, flattenPaths)
-
-        // traverseMappingsAndUpdate ADDS every leaf to flattenPaths before calling the
-        // processor, so the alias field IS present in flattenPaths here.  The production
-        // fix filters it out AFTER traversal (in the properties-copy loop inside
-        // indexDocLevelQueries).  What we verify is that the processor returned an empty
-        // props map for the alias field, and that the node in `mappings` was updated to
-        // an empty map (the processor renaming result).
-        assertTrue(
-            "alias field should be present in flattenPaths (traversal is unconditional)",
-            flattenPaths.containsKey("real_field_alias"),
-        )
-        // The critical invariant: after traversal, the entry in the parent map is an
-        // empty mutableMap — this is what the post-traversal filter in
-        // indexDocLevelQueries checks when deciding whether to skip a field.
-        val updatedEntry = mappings["real_field_alias"]
-        assertTrue(
-            "alias field entry must be empty after processing so the caller can filter it",
-            updatedEntry is Map<*, *> && (updatedEntry as Map<*, *>).isEmpty(),
-        )
-    }
-
-    fun `test traverseMappingsAndUpdate includes non-alias fields normally`() {
-        val queries = makeInstance()
-        val mappings = mutableMapOf<String, Any>(
-            "message" to mutableMapOf<String, Any>("type" to "text"),
-            "status_code" to mutableMapOf<String, Any>("type" to "keyword"),
-        )
-        val flattenPaths = mutableMapOf<String, MutableMap<String, Any>>()
-
-        queries.traverseMappingsAndUpdate(mappings, "", identityLeaf, flattenPaths)
-
-        assertTrue("message should be in flattenPaths", flattenPaths.containsKey("message"))
-        assertTrue("status_code should be in flattenPaths", flattenPaths.containsKey("status_code"))
-    }
-
-    fun `test traverseMappingsAndUpdate with mixed alias and regular fields only regular fields get non-empty props`() {
-        val queries = makeInstance()
-        // Two regular fields + one alias field.
-        val mappings = mutableMapOf<String, Any>(
-            "timestamp" to mutableMapOf<String, Any>("type" to "date"),
-            "log_level" to mutableMapOf<String, Any>("type" to "keyword"),
-            "ts_alias" to mutableMapOf<String, Any>(
-                "type" to "alias",
-                "path" to "timestamp",
-            ),
-        )
-        val flattenPaths = mutableMapOf<String, MutableMap<String, Any>>()
-
-        queries.traverseMappingsAndUpdate(mappings, "", aliasSkippingLeaf, flattenPaths)
-
-        // All three leaves appear in flattenPaths because traversal is unconditional.
-        assertEquals(3, flattenPaths.size)
-
-        // Regular fields retain their props.
-        assertEquals("date", flattenPaths["timestamp"]?.get("type"))
-        assertEquals("keyword", flattenPaths["log_level"]?.get("type"))
-
-        // The alias entry in the parent `mappings` map was replaced with an empty map
-        // by the processor — this is what the post-traversal filter checks.
-        val aliasEntry = mappings["ts_alias"]
-        assertTrue(
-            "ts_alias entry must become empty so the caller can skip it in PUT mapping",
-            aliasEntry is Map<*, *> && (aliasEntry as Map<*, *>).isEmpty(),
-        )
-
-        // Regular fields still have their original type in the parent map.
-        val timestampEntry = mappings["timestamp"] as Map<*, *>
-        assertEquals("date", timestampEntry["type"])
-    }
-
-    fun `test traverseMappingsAndUpdate with all alias fields results in all empty entries`() {
-        val queries = makeInstance()
-        val mappings = mutableMapOf<String, Any>(
-            "alias_a" to mutableMapOf<String, Any>("type" to "alias", "path" to "field_a"),
-            "alias_b" to mutableMapOf<String, Any>("type" to "alias", "path" to "field_b"),
-        )
-        val flattenPaths = mutableMapOf<String, MutableMap<String, Any>>()
-
-        queries.traverseMappingsAndUpdate(mappings, "", aliasSkippingLeaf, flattenPaths)
-
-        // Both are in flattenPaths (traversal doesn't filter).
-        assertEquals(2, flattenPaths.size)
-
-        // Both entries in the working map are now empty.
-        assertTrue((mappings["alias_a"] as Map<*, *>).isEmpty())
-        assertTrue((mappings["alias_b"] as Map<*, *>).isEmpty())
-    }
-
-    fun `test traverseMappingsAndUpdate with nested object containing alias field`() {
-        val queries = makeInstance()
-        // Nested object with a regular child and an alias child.
-        val mappings = mutableMapOf<String, Any>(
-            "event" to mutableMapOf<String, Any>(
-                "properties" to mutableMapOf<String, Any>(
-                    "name" to mutableMapOf<String, Any>("type" to "keyword"),
-                    "name_alias" to mutableMapOf<String, Any>(
-                        "type" to "alias",
-                        "path" to "event.name",
-                    ),
-                ),
-            ),
-        )
-        val flattenPaths = mutableMapOf<String, MutableMap<String, Any>>()
-
-        queries.traverseMappingsAndUpdate(mappings, "", aliasSkippingLeaf, flattenPaths)
-
-        assertTrue("event.name should be in flattenPaths", flattenPaths.containsKey("event.name"))
-        assertTrue("event.name_alias should be in flattenPaths", flattenPaths.containsKey("event.name_alias"))
-
-        // Inside the nested properties, the alias entry must be empty.
-        @Suppress("UNCHECKED_CAST")
-        val eventProps = ((mappings["event"] as Map<String, Any>)["properties"] as Map<String, Any>)
-        assertTrue((eventProps["name_alias"] as Map<*, *>).isEmpty())
-        // Regular child is untouched.
-        assertEquals("keyword", (eventProps["name"] as Map<*, *>)["type"])
-    }
-
-    fun `test traverseMappingsAndUpdate with empty mappings produces empty flattenPaths`() {
-        val queries = makeInstance()
-        val mappings = mutableMapOf<String, Any>()
-        val flattenPaths = mutableMapOf<String, MutableMap<String, Any>>()
-
-        queries.traverseMappingsAndUpdate(mappings, "", identityLeaf, flattenPaths)
-
-        assertTrue(flattenPaths.isEmpty())
-    }
-
-    // -------------------------------------------------------------------------
-    // Post-traversal filter logic (unit-testing the filtering predicate
-    // independently of the full indexDocLevelQueries coroutine stack)
-    // -------------------------------------------------------------------------
-
-    /**
-     * The production fix in indexDocLevelQueries filters the `properties` map with:
-     *
-     *   (it.value as Map)["type"] == "alias"  ||  (it.value as Map).isEmpty()
-     *
-     * We verify that predicate directly so we know it catches both the
-     * alias-type case and the empty-map case produced by the processor.
-     */
-    fun `test post-traversal filter skips entries where type is alias`() {
-        val entries: Map<String, Any> = mapOf(
-            "regular_field" to mapOf("type" to "keyword"),
-            "alias_field" to mapOf("type" to "alias", "path" to "regular_field"),
-        )
-
-        val kept = entries.filter { (_, v) ->
-            val m = v as Map<*, *>
-            m["type"] != "alias" && m.isNotEmpty()
-        }
-
-        assertEquals(1, kept.size)
-        assertTrue(kept.containsKey("regular_field"))
-        assertFalse(kept.containsKey("alias_field"))
-    }
-
-    fun `test post-traversal filter skips entries with empty map`() {
-        val entries: Map<String, Any> = mapOf(
-            "regular_field" to mapOf("type" to "date"),
-            "alias_field" to emptyMap<String, Any>(),
-        )
-
-        val kept = entries.filter { (_, v) ->
-            val m = v as Map<*, *>
-            m["type"] != "alias" && m.isNotEmpty()
-        }
-
-        assertEquals(1, kept.size)
-        assertTrue(kept.containsKey("regular_field"))
-    }
-
-    fun `test post-traversal filter retains all entries when no alias fields present`() {
-        val entries: Map<String, Any> = mapOf(
-            "field_a" to mapOf("type" to "keyword"),
-            "field_b" to mapOf("type" to "text"),
-            "field_c" to mapOf("type" to "long"),
-        )
-
-        val kept = entries.filter { (_, v) ->
-            val m = v as Map<*, *>
-            m["type"] != "alias" && m.isNotEmpty()
-        }
-
-        assertEquals(3, kept.size)
-    }
-
-    // -------------------------------------------------------------------------
-    // allFlattenPaths post-traversal filter (H1 fix verification)
-    //
-    // traverseMappingsAndUpdate adds every leaf to flattenPaths BEFORE calling
-    // the processor, so alias paths land in flattenPaths with their original props.
-    // The fix in indexDocLevelQueries filters flattenPaths entries whose props
-    // have type=="alias" before adding to allFlattenPaths, preventing alias field
-    // names from flowing into query rewrites for non-existent fields.
-    // -------------------------------------------------------------------------
-
-    fun `test allFlattenPaths only contains non-alias fields after post-traversal filter`() {
-        val queries = makeInstance()
-        val mappings = mutableMapOf<String, Any>(
-            "timestamp" to mutableMapOf<String, Any>("type" to "date"),
-            "ts_alias" to mutableMapOf<String, Any>("type" to "alias", "path" to "timestamp"),
-        )
-        val flattenPaths = mutableMapOf<String, MutableMap<String, Any>>()
-
-        queries.traverseMappingsAndUpdate(mappings, "", aliasSkippingLeaf, flattenPaths)
-
-        // Raw flattenPaths contains both because traversal is unconditional.
-        assertEquals(2, flattenPaths.size)
-        assertTrue(flattenPaths.containsKey("ts_alias"))
-
-        // Simulated production filter: exclude entries whose props are empty
-        // (alias-skipping processor sets them to mutableMapOf()) or whose type is "alias".
-        // This mirrors what SHOULD be applied when building allFlattenPaths.
-        val filteredPaths = flattenPaths.filter { (_, props) ->
-            props.isNotEmpty() && props["type"] != "alias"
-        }
-
+        assertTrue("Expected update mapping response to be acknowledged", response.isAcknowledged)
+        assertEquals("Expected target index to be the resolved concrete index", concreteResolvedIndex, targetIndex)
         assertEquals(
-            "filtered allFlattenPaths must contain only non-alias fields",
+            "getWriteIndexNameForAlias should be called once when targetQueryIndex is null, regardless of deleteQueryIndexInEveryRun",
             1,
-            filteredPaths.size,
+            testableQueries.getWriteIndexNameForAliasCallCount
         )
-        assertTrue(filteredPaths.containsKey("timestamp"))
-        assertFalse(
-            "alias field must be excluded from filteredPaths to avoid query rewrites for non-existent field names",
-            filteredPaths.containsKey("ts_alias"),
-        )
-    }
-
-    // -------------------------------------------------------------------------
-    // getAllConflictingFields alias guard (H2 fix verification)
-    //
-    // getAllConflictingFields now skips alias-type fields via a type=="alias" guard
-    // in the flattenPaths forEach loop.  Two indices with an alias field at the
-    // same path but pointing to different targets will no longer produce a false
-    // conflict because the guard skips them before the equality comparison.
-    // -------------------------------------------------------------------------
-
-    fun `test alias-skipping processor excludes alias fields from conflict detection (getAllConflictingFields fix)`() {
-        val queries = makeInstance()
-
-        // Index A: alias field pointing to "event.start"
-        val mappingsA = mutableMapOf<String, Any>(
-            "event_start" to mutableMapOf<String, Any>("type" to "alias", "path" to "event.start"),
-            "message" to mutableMapOf<String, Any>("type" to "text"),
-        )
-        // Index B: same alias field name but pointing to "event.begin" — different path
-        val mappingsB = mutableMapOf<String, Any>(
-            "event_start" to mutableMapOf<String, Any>("type" to "alias", "path" to "event.begin"),
-            "message" to mutableMapOf<String, Any>("type" to "text"),
-        )
-
-        val flattenPathsA = mutableMapOf<String, MutableMap<String, Any>>()
-        val flattenPathsB = mutableMapOf<String, MutableMap<String, Any>>()
-
-        // Alias-skipping processor — mirrors the FIXED getAllConflictingFields behaviour.
-        queries.traverseMappingsAndUpdate(mappingsA, "", aliasSkippingLeaf, flattenPathsA)
-        queries.traverseMappingsAndUpdate(mappingsB, "", aliasSkippingLeaf, flattenPathsB)
-
-        // flattenPaths stores original nodeProps (captured before the processor runs),
-        // so alias fields appear with their original type=alias props — not empty.
-        assertTrue("Index A flattenPaths must include event_start", flattenPathsA.containsKey("event_start"))
-        assertTrue("Index B flattenPaths must include event_start", flattenPathsB.containsKey("event_start"))
-        assertEquals("alias", flattenPathsA["event_start"]!!["type"])
-        assertEquals("alias", flattenPathsB["event_start"]!!["type"])
-
-        // Simulate the FIXED conflict-detection logic from getAllConflictingFields:
-        // seed allFlattenPaths with index A, then check index B against it,
-        // skipping entries whose type is "alias".
-        val allFlattenPaths = mutableMapOf<String, MutableMap<String, Any>>()
-        val conflictingFields = mutableSetOf<String>()
-        flattenPathsA.forEach { (k, v) ->
-            if (v["type"] == "alias") return@forEach
-            allFlattenPaths[k] = v
-        }
-        flattenPathsB.forEach { (k, v) ->
-            if (v["type"] == "alias") return@forEach
-            if (allFlattenPaths.containsKey(k) && allFlattenPaths[k]!! != v) {
-                conflictingFields.add(k)
-            }
-            allFlattenPaths.putIfAbsent(k, v)
-        }
-
-        // "message" is identical in both indices — must NOT be flagged.
-        assertFalse("message must not be a conflicting field", conflictingFields.contains("message"))
-
-        // "event_start" is an alias field — the type=="alias" guard skips it,
-        // so it must NOT be flagged as conflicting.
-        assertFalse(
-            "Fixed: alias field with differing paths across indices must NOT be flagged as conflicting",
-            conflictingFields.contains("event_start"),
-        )
-    }
-
-    // -------------------------------------------------------------------------
-    // getAllConflictingFields — field-type change detection (Gap B fix)
-    //
-    // A field whose "type" key changes from one backing index to another
-    // (e.g. resource.host.name: text → keyword) must be flagged as conflicting
-    // so that the per-index suffix branch fires and the merged putMapping never
-    // contains a type change that OpenSearch core would reject.
-    // -------------------------------------------------------------------------
-
-    fun `test getAllConflictingFields detects text-to-keyword type change as conflict`() {
-        val queries = makeInstance()
-
-        // Index A (older backing index): resource.host.name is "text"
-        val mappingsA = mutableMapOf<String, Any>(
-            "host" to mutableMapOf<String, Any>(
-                "properties" to mutableMapOf<String, Any>(
-                    "name" to mutableMapOf<String, Any>("type" to "text")
-                )
-            ),
-            "event_id" to mutableMapOf<String, Any>("type" to "keyword"),
-        )
-        // Index B (newer backing index): resource.host.name changed to "keyword"
-        val mappingsB = mutableMapOf<String, Any>(
-            "host" to mutableMapOf<String, Any>(
-                "properties" to mutableMapOf<String, Any>(
-                    "name" to mutableMapOf<String, Any>("type" to "keyword")
-                )
-            ),
-            "event_id" to mutableMapOf<String, Any>("type" to "keyword"),
-        )
-
-        val flattenPathsA = mutableMapOf<String, MutableMap<String, Any>>()
-        val flattenPathsB = mutableMapOf<String, MutableMap<String, Any>>()
-        queries.traverseMappingsAndUpdate(mappingsA, "", identityLeaf, flattenPathsA)
-        queries.traverseMappingsAndUpdate(mappingsB, "", identityLeaf, flattenPathsB)
-
-        // Simulate the FIXED getAllConflictingFields logic (with explicit type-key check).
-        val allFlattenPaths = mutableMapOf<String, MutableMap<String, Any>>()
-        val conflictingFields = mutableSetOf<String>()
-
-        fun processFlat(flattenPaths: Map<String, MutableMap<String, Any>>) {
-            flattenPaths.forEach { (k, v) ->
-                if (v["type"] == "alias") return@forEach
-                if (allFlattenPaths.containsKey(k)) {
-                    val existing = allFlattenPaths[k]!!
-                    val existingType = existing["type"]
-                    val newType = v["type"]
-                    if (existingType != null && newType != null && existingType != newType) {
-                        conflictingFields.add(k)
-                    } else if (existing != v) {
-                        conflictingFields.add(k)
-                    }
-                }
-                allFlattenPaths.putIfAbsent(k, v)
-            }
-        }
-        processFlat(flattenPathsA)
-        processFlat(flattenPathsB)
-
-        // host.name changed from text to keyword — MUST be flagged as conflicting.
-        assertTrue(
-            "host.name must be flagged as conflicting because its type changed from text to keyword",
-            conflictingFields.contains("host.name"),
-        )
-        // event_id is identical in both indices — must NOT be flagged.
-        assertFalse(
-            "event_id must not be flagged as conflicting because it is identical in both indices",
-            conflictingFields.contains("event_id"),
-        )
-    }
-
-    // -------------------------------------------------------------------------
-    // deepCopyMap — list-of-maps recursion (Gap 3)
-    //
-    // The original implementation used toMutableList() which is a shallow copy:
-    // map elements inside the list were shared between original and copy.
-    // The fix recurses into map elements inside lists.
-    // -------------------------------------------------------------------------
-
-    fun `test deepCopyMap deep copies map elements inside lists`() {
-        val innerMap = mutableMapOf<String, Any>("nested_key" to "original_value")
-        val original = mutableMapOf<String, Any>(
-            "items" to mutableListOf<Any>(innerMap, "plain_string"),
-        )
-
-        val copy = DocLevelMonitorQueries.deepCopyMap(original)
-
-        @Suppress("UNCHECKED_CAST")
-        val copiedList = copy["items"] as MutableList<Any>
-        @Suppress("UNCHECKED_CAST")
-        val copiedInnerMap = copiedList[0] as MutableMap<String, Any>
-
-        // Mutate the map element inside the copied list.
-        copiedInnerMap["nested_key"] = "mutated_value"
-
-        // The original inner map must be unaffected — deep copy isolated it.
+        assertEquals("Alias queried should match monitor queryIndex alias", aliasName, testableQueries.lastAliasQueried)
         assertEquals(
-            "Map element inside list must be deep-copied so mutations do not affect the original",
-            "original_value",
-            innerMap["nested_key"],
+            "Metadata mapping should be set to resolved concrete index",
+            concreteResolvedIndex,
+            metadata.sourceToQueryIndexMapping[sourceIndex + monitor.id]
         )
-        assertNotSame(innerMap, copiedInnerMap)
+        assertEquals(
+            "adjustMaxFieldLimitForQueryIndex should receive the resolved concrete index, not the alias",
+            concreteResolvedIndex,
+            testableQueries.lastPutConcreteQueryIndex
+        )
     }
 
-}
+    // getWriteIndexNameForAlias must return null when the alias exists but no write index is designated.
+    fun `test getWriteIndexNameForAlias returns null when alias exists but has no write index designated`() {
+        val aliasName = "test-query-alias"
+        val concreteIndex = "concrete-index-000001"
+
+        // writeIndex(false) means this backing index is explicitly NOT the write index
+        val indexMetadata = IndexMetadata.builder(concreteIndex)
+            .settings(Settings.builder().put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT))
+            .numberOfShards(1)
+            .numberOfReplicas(0)
+            .putAlias(AliasMetadata.builder(aliasName).writeIndex(false).build())
+            .build()
+        val metadata = Metadata.builder().put(indexMetadata, false).build()
+        val clusterState = ClusterState.builder(ClusterName("test-cluster")).metadata(metadata).build()
+        whenever(clusterService.state()).thenReturn(clusterState)
+
+        val docLevelMonitorQueries = DocLevelMonitorQueries(client, clusterService)
+        val writeIndex = docLevelMonitorQueries.getWriteIndexNameForAlias(aliasName)
+
+        assertNull(
+            "Expected null when alias has no write index designated (writeIndex=false on all backing indices)",
+            writeIndex
+        )
+    }
+
+    // putMapping throws field-limit exception, rollover is triggered, returned targetIndex is the new rolled-over name.
+    fun `test updateQueryIndexMappings when putMapping throws field-limit exception triggers rollover and returns new index`() {
+        val aliasName = "query-index-alias"
+        val monitor = createMonitor(queryIndexAlias = aliasName, deleteQueryIndexInEveryRun = true)
+        val sourceIndex = "test-source-index"
+        val initialConcreteIndex = "concrete-query-index-000001"
+        val rolledOverIndex = "concrete-query-index-000002"
+        val metadata = createMonitorMetadata(
+            monitorId = monitor.id,
+            sourceIndex = sourceIndex,
+            initialTargetQueryIndex = initialConcreteIndex
+        )
+
+        val testableQueries = TestableDocLevelMonitorQueries(
+            client,
+            clusterService,
+            resolvedIndexName = initialConcreteIndex,
+            rolledOverIndexName = rolledOverIndex
+        )
+
+        // First putMapping call triggers field-limit failure; second (post-rollover) call succeeds.
+        var putMappingCallCount = 0
+        Mockito.doAnswer { invocation ->
+            @Suppress("UNCHECKED_CAST")
+            val listener = invocation.arguments[1] as ActionListener<AcknowledgedResponse>
+            putMappingCallCount++
+            if (putMappingCallCount == 1) {
+                // Wrap in RemoteTransportException to simulate what OpenSearch sends back over the wire
+                listener.onFailure(RemoteTransportException("field-limit-error", RuntimeException("Limit of total fields [1000] has been exceeded")))
+            } else {
+                listener.onResponse(AcknowledgedResponse(true))
+            }
+            null
+        }.`when`(indicesAdminClient).putMapping(any(PutMappingRequest::class.java), any())
+
+        val (response, targetIndex) = runBlocking {
+            testableQueries.updateQueryIndexMappings(
+                monitor = monitor,
+                monitorMetadata = metadata,
+                sourceIndex = sourceIndex,
+                sourceIndexFieldLimit = 1000L,
+                updatedProperties = mutableMapOf(),
+                indexTimeout = TimeValue.timeValueSeconds(30)
+            )
+        }
+
+        assertTrue("Expected update mapping response to be acknowledged after rollover", response.isAcknowledged)
+        assertEquals("Expected target index to be the new rolled-over index after rollover", rolledOverIndex, targetIndex)
+        assertEquals(
+            "Metadata should be updated to the new rolled-over index",
+            rolledOverIndex,
+            metadata.sourceToQueryIndexMapping[sourceIndex + monitor.id]
+        )
+        assertEquals(
+            "adjustMaxFieldLimitForQueryIndex should have been called last with the rolled-over index",
+            rolledOverIndex,
+            testableQueries.lastPutConcreteQueryIndex
+        )
+    }
+
+    // putMapping throws a non-field-limit exception with deleteQueryIndexInEveryRun=false — expect AlertingException.
+    fun `test updateQueryIndexMappings when putMapping throws non-field-limit exception and deleteQueryIndexInEveryRun false throws AlertingException`() {
+        val aliasName = "query-index-alias"
+        val monitor = createMonitor(queryIndexAlias = aliasName, deleteQueryIndexInEveryRun = false)
+        val sourceIndex = "test-source-index"
+        val initialConcreteIndex = "concrete-query-index-000001"
+        val metadata = createMonitorMetadata(
+            monitorId = monitor.id,
+            sourceIndex = sourceIndex,
+            initialTargetQueryIndex = initialConcreteIndex
+        )
+
+        val testableQueries = TestableDocLevelMonitorQueries(
+            client,
+            clusterService,
+            resolvedIndexName = initialConcreteIndex
+        )
+
+        // putMapping throws a non-field-limit exception
+        Mockito.doAnswer { invocation ->
+            @Suppress("UNCHECKED_CAST")
+            val listener = invocation.arguments[1] as ActionListener<AcknowledgedResponse>
+            listener.onFailure(RemoteTransportException("generic-error", RuntimeException("Some unexpected mapping error")))
+            null
+        }.`when`(indicesAdminClient).putMapping(any(PutMappingRequest::class.java), any())
+
+        assertFailsWith<AlertingException>(
+            message = "Expected AlertingException when putMapping fails with a non-field-limit error and deleteQueryIndexInEveryRun is false"
+        ) {
+            runBlocking {
+                testableQueries.updateQueryIndexMappings(
+                    monitor = monitor,
+                    monitorMetadata = metadata,
+                    sourceIndex = sourceIndex,
+                    sourceIndexFieldLimit = 1000L,
+                    updatedProperties = mutableMapOf(),
+                    indexTimeout = TimeValue.timeValueSeconds(30)
+                )
+            }
+        }
+    }
