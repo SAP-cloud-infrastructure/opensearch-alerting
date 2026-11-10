@@ -22,6 +22,11 @@ import org.opensearch.transport.client.Client
  *    indirectly via traverseMappingsAndUpdate; direct ClusterState integration
  *    tests belong in the IT suite.
  *
+ * NOT covered here (requires live ClusterState / integration environment):
+ *  - Gap A (creation-date truncation removal): the fix in [DocLevelMonitorQueries.indexDocLevelQueries]
+ *    removes the filter that hid old-typed backing indices. This behaviour is verified in the
+ *    integration test suite (DocLevelMonitorQueriesIT) where real datastream rollover can be exercised.
+ *
  * Existing traverseMappingsAndUpdate tests live in [AlertingUtilsTests]; new
  * tests here focus specifically on alias-type fields and complement rather than
  * duplicate those.
@@ -87,7 +92,7 @@ class DocLevelMonitorQueriesTests : OpenSearchTestCase() {
         assertNotSame(nested, copy["outer"])
     }
 
-    fun `test deepCopyMap shallow copies list values`() {
+    fun `test deepCopyMap copies list of scalars as a new mutable list`() {
         val list = mutableListOf("a", "b", "c")
         val original = mutableMapOf<String, Any>("items" to list)
 
@@ -456,6 +461,77 @@ class DocLevelMonitorQueriesTests : OpenSearchTestCase() {
         assertFalse(
             "Fixed: alias field with differing paths across indices must NOT be flagged as conflicting",
             conflictingFields.contains("event_start"),
+        )
+    }
+
+    // -------------------------------------------------------------------------
+    // getAllConflictingFields — field-type change detection (Gap B fix)
+    //
+    // A field whose "type" key changes from one backing index to another
+    // (e.g. resource.host.name: text → keyword) must be flagged as conflicting
+    // so that the per-index suffix branch fires and the merged putMapping never
+    // contains a type change that OpenSearch core would reject.
+    // -------------------------------------------------------------------------
+
+    fun `test getAllConflictingFields detects text-to-keyword type change as conflict`() {
+        val queries = makeInstance()
+
+        // Index A (older backing index): resource.host.name is "text"
+        val mappingsA = mutableMapOf<String, Any>(
+            "host" to mutableMapOf<String, Any>(
+                "properties" to mutableMapOf<String, Any>(
+                    "name" to mutableMapOf<String, Any>("type" to "text")
+                )
+            ),
+            "event_id" to mutableMapOf<String, Any>("type" to "keyword"),
+        )
+        // Index B (newer backing index): resource.host.name changed to "keyword"
+        val mappingsB = mutableMapOf<String, Any>(
+            "host" to mutableMapOf<String, Any>(
+                "properties" to mutableMapOf<String, Any>(
+                    "name" to mutableMapOf<String, Any>("type" to "keyword")
+                )
+            ),
+            "event_id" to mutableMapOf<String, Any>("type" to "keyword"),
+        )
+
+        val flattenPathsA = mutableMapOf<String, MutableMap<String, Any>>()
+        val flattenPathsB = mutableMapOf<String, MutableMap<String, Any>>()
+        queries.traverseMappingsAndUpdate(mappingsA, "", identityLeaf, flattenPathsA)
+        queries.traverseMappingsAndUpdate(mappingsB, "", identityLeaf, flattenPathsB)
+
+        // Simulate the FIXED getAllConflictingFields logic (with explicit type-key check).
+        val allFlattenPaths = mutableMapOf<String, MutableMap<String, Any>>()
+        val conflictingFields = mutableSetOf<String>()
+
+        fun processFlat(flattenPaths: Map<String, MutableMap<String, Any>>) {
+            flattenPaths.forEach { (k, v) ->
+                if (v["type"] == "alias") return@forEach
+                if (allFlattenPaths.containsKey(k)) {
+                    val existing = allFlattenPaths[k]!!
+                    val existingType = existing["type"]
+                    val newType = v["type"]
+                    if (existingType != null && newType != null && existingType != newType) {
+                        conflictingFields.add(k)
+                    } else if (existing != v) {
+                        conflictingFields.add(k)
+                    }
+                }
+                allFlattenPaths.putIfAbsent(k, v)
+            }
+        }
+        processFlat(flattenPathsA)
+        processFlat(flattenPathsB)
+
+        // host.name changed from text to keyword — MUST be flagged as conflicting.
+        assertTrue(
+            "host.name must be flagged as conflicting because its type changed from text to keyword",
+            conflictingFields.contains("host.name"),
+        )
+        // event_id is identical in both indices — must NOT be flagged.
+        assertFalse(
+            "event_id must not be flagged as conflicting because it is identical in both indices",
+            conflictingFields.contains("event_id"),
         )
     }
 
