@@ -57,6 +57,7 @@ import org.opensearch.alerting.util.MAX_SEARCH_SIZE
 import org.opensearch.alerting.util.MustacheTemplateService
 import org.opensearch.alerting.util.defaultToPerExecutionAction
 import org.opensearch.alerting.util.destinationmigration.NotificationActionConfigs
+import org.opensearch.alerting.util.getBucketKeysHash
 import org.opensearch.alerting.util.destinationmigration.NotificationApiUtils
 import org.opensearch.alerting.util.destinationmigration.getTitle
 import org.opensearch.alerting.util.destinationmigration.publishLegacyNotification
@@ -83,6 +84,7 @@ import org.opensearch.commons.alerting.action.PublishFindingsRequest
 import org.opensearch.commons.alerting.action.SubscribeFindingsResponse
 import org.opensearch.commons.alerting.model.ActionExecutionResult
 import org.opensearch.commons.alerting.model.ActionRunResult
+import org.opensearch.commons.alerting.model.AggregationResultBucket
 import org.opensearch.commons.alerting.model.Alert
 import org.opensearch.commons.alerting.model.DocLevelMonitorInput
 import org.opensearch.commons.alerting.model.DocLevelQuery
@@ -427,11 +429,6 @@ class TransportDocLevelMonitorFanOutAction
             "Monitor ${monitor.id} trigger [${trigger.name}]: triggeredDocs.size=[${triggerResult.triggeredDocs.size}]"
         )
         if (triggerResult.triggeredDocs.isNotEmpty()) {
-            // Load the existing alert only when the trigger fired — skipping this search when
-            // triggeredDocs is empty avoids an unnecessary index round-trip per backing index.
-            val existingAlert = if (!isTempMonitor) {
-                alertService.loadCurrentAlertsForSingleGroupedDocLevelMonitor(monitor, workflowRunContext)[trigger.id]
-            } else null
             // Extract the ruleId deterministically from the trigger condition.
             // convertToConditionForChainedFindings() always produces "(query[tag=<ruleId>])" so we
             // can parse it reliably rather than scanning queryToDocIds which may have multiple
@@ -443,74 +440,183 @@ class TransportDocLevelMonitorFanOutAction
                     "conditionRuleId=[$conditionRuleId]"
             )
 
-            // Look up only this trigger's finding ID from matchingDocIdsPerIndex["finding:<ruleId>"].
-            // Falls back to the full findingIds list if the per-rule key is absent (e.g. non-workflow run).
-            val findingIds: List<String> = if (conditionRuleId != null &&
+            val perRuleFindingIds: List<String>? = if (conditionRuleId != null &&
                 workflowRunContext?.matchingDocIdsPerIndex != null
             ) {
-                val perRuleFindingIds = workflowRunContext.matchingDocIdsPerIndex["finding:$conditionRuleId"]
-                log.info(
-                    "Monitor ${monitor.id} trigger [${trigger.name}]: " +
-                        "perRuleFindingIds=[$perRuleFindingIds] (key=finding:$conditionRuleId)"
-                )
-                perRuleFindingIds ?: (workflowRunContext.findingIds ?: listOf())
-            } else {
-                workflowRunContext?.findingIds ?: listOf()
-            }
+                workflowRunContext.matchingDocIdsPerIndex["finding:$conditionRuleId"]
+            } else null
             log.info(
-                "Monitor ${monitor.id} trigger [${trigger.name}]: final findingIds=[$findingIds]"
+                "Monitor ${monitor.id} trigger [${trigger.name}]: " +
+                    "perRuleFindingIds=[$perRuleFindingIds] (key=finding:$conditionRuleId)"
             )
 
             val triggerCtx = DocumentLevelTriggerExecutionContext(monitor, trigger, clusterSettings = clusterService.clusterSettings)
-            val composedAlert = alertService.composeDocLevelAlert(
-                findingIds,
-                triggerResult.triggeredDocs,
-                triggerCtx,
-                monitorResult.alertError() ?: triggerResult.alertError(),
-                executionId = executionId,
-                workflorwRunContext = workflowRunContext
-            )
-            // When an existing ACTIVE or ACKNOWLEDGED alert is found for this trigger, merge it
-            // with the newly composed alert so that:
-            //   • startTime is preserved from the first detection
-            //   • finding_ids and related_doc_ids accumulate across runs
-            //   • id is reused so saveAlerts updates in-place (deduplication)
-            //   • state is preserved — ACKNOWLEDGED stays ACKNOWLEDGED so analysts are not
-            //     forced to re-acknowledge the same ongoing condition on every monitor execution.
-            val alert = if (existingAlert != null &&
-                (existingAlert.state == Alert.State.ACTIVE || existingAlert.state == Alert.State.ACKNOWLEDGED)
-            ) {
-                val mergedFindingIds = (existingAlert.findingIds + composedAlert.findingIds).distinct()
-                val mergedRelatedDocIds = (existingAlert.relatedDocIds + composedAlert.relatedDocIds).distinct()
-                composedAlert.copy(
-                    id = existingAlert.id,
-                    startTime = existingAlert.startTime,
-                    state = existingAlert.state,
-                    acknowledgedTime = existingAlert.acknowledgedTime,
-                    findingIds = mergedFindingIds,
-                    relatedDocIds = mergedRelatedDocIds
+
+            if (!perRuleFindingIds.isNullOrEmpty() && workflowRunContext != null) {
+                // Per-bucket path: look up delegate alerts and create one chained findings alert per bucket.
+                // This preserves per-bucket cardinality (user A and user B each get their own alert) and
+                // propagates the agg_alert_content (bucket keys + doc count) from the delegate alert.
+                val findingIdToBucket: Map<String, AggregationResultBucket> = alertService.loadDelegateAlertsByFindingIds(
+                    perRuleFindingIds, monitor.dataSources.alertsIndex, workflowRunContext.workflowId, monitor.id
                 )
-            } else composedAlert
-            for (action in trigger.actions) {
-                this.runAction(action, triggerCtx.copy(alerts = listOf(AlertContext(alert))), monitor, dryrun)
-            }
+                log.info(
+                    "Monitor ${monitor.id} trigger [${trigger.name}]: " +
+                        "findingIdToBucket.size=[${findingIdToBucket.size}] " +
+                        "perRuleFindingIds.size=[${perRuleFindingIds.size}]"
+                )
 
-            if (!dryrun && monitor.id != Monitor.NO_ID) {
-                val actionResults = triggerResult.actionResultsMap.getOrDefault(alert.id, emptyMap())
-                val actionExecutionResults = actionResults.values.map { actionRunResult ->
-                    ActionExecutionResult(actionRunResult.actionId, actionRunResult.executionTime, if (actionRunResult.throttled) 1 else 0)
+                // Group per-rule findings by bucket key hash.
+                // Multiple findings map to the same bucket when the aggregation spans several backing indices.
+                val bucketToFindings = mutableMapOf<String, Pair<AggregationResultBucket, MutableList<String>>>()
+                val ungroupedFindings = mutableListOf<String>()
+                for (fid in perRuleFindingIds) {
+                    val bucket = findingIdToBucket[fid]
+                    if (bucket != null) {
+                        val key = bucket.getBucketKeysHash()
+                        bucketToFindings.getOrPut(key) { Pair(bucket, mutableListOf()) }.second.add(fid)
+                    } else {
+                        ungroupedFindings.add(fid)
+                    }
                 }
-                val updatedAlert = alert.copy(actionExecutionResults = actionExecutionResults)
 
-                retryPolicy.let {
-                    alertService.saveAlerts(
-                        monitor.dataSources,
-                        listOf(updatedAlert),
-                        it,
-                        allowUpdatingAcknowledgedAlert = existingAlert?.state == Alert.State.ACKNOWLEDGED,
-                        routingId = monitor.id,
-                        refreshAfterWrite = true
+                val existingAlerts: Map<String, Alert> = if (!isTempMonitor) {
+                    alertService.loadCurrentAlertsForSingleGroupedDocLevelMonitor(monitor, workflowRunContext)
+                } else emptyMap()
+
+                // Build the list of (finalAlert, existingAlert) for per-bucket alerts
+                val alertsToSave = mutableListOf<Pair<Alert, Alert?>>()
+                for ((bucketKeyHash, bucketAndFindings) in bucketToFindings) {
+                    val (aggBucket, bucketFindingIds) = bucketAndFindings
+
+                    // Per-bucket related docs: collect all source document IDs for this bucket's findings.
+                    // triggeredDocs for the chained findings monitor contains finding IDs (not source doc IDs),
+                    // so intersecting them with source doc IDs always yields empty. Use bucketDocIds directly.
+                    val bucketDocIds: List<String> = bucketFindingIds.flatMap { fid ->
+                        workflowRunContext.matchingDocIdsPerIndex["docs:$fid"] ?: emptyList()
+                    }
+                    val perBucketTriggeredDocs: List<String> = bucketDocIds.ifEmpty { triggerResult.triggeredDocs }
+
+                    val existingAlert = existingAlerts["${trigger.id}_$bucketKeyHash"]
+                    val composedAlert = alertService.composeDocLevelAlert(
+                        bucketFindingIds,
+                        perBucketTriggeredDocs,
+                        triggerCtx,
+                        monitorResult.alertError() ?: triggerResult.alertError(),
+                        executionId = executionId,
+                        workflorwRunContext = workflowRunContext,
+                        aggregationResultBucket = aggBucket
                     )
+                    val alert = if (existingAlert != null &&
+                        (existingAlert.state == Alert.State.ACTIVE || existingAlert.state == Alert.State.ACKNOWLEDGED)
+                    ) {
+                        composedAlert.copy(
+                            id = existingAlert.id,
+                            startTime = existingAlert.startTime,
+                            state = existingAlert.state,
+                            acknowledgedTime = existingAlert.acknowledgedTime,
+                            findingIds = (existingAlert.findingIds + composedAlert.findingIds).distinct(),
+                            relatedDocIds = (existingAlert.relatedDocIds + composedAlert.relatedDocIds).distinct()
+                        )
+                    } else composedAlert
+                    alertsToSave.add(Pair(alert, existingAlert))
+                }
+
+                // Consolidated fallback for findings with no matching delegate alert (non-agg or edge cases)
+                if (ungroupedFindings.isNotEmpty()) {
+                    val existingAlert = existingAlerts[trigger.id]
+                    val composedAlert = alertService.composeDocLevelAlert(
+                        ungroupedFindings,
+                        triggerResult.triggeredDocs,
+                        triggerCtx,
+                        monitorResult.alertError() ?: triggerResult.alertError(),
+                        executionId = executionId,
+                        workflorwRunContext = workflowRunContext
+                    )
+                    val alert = if (existingAlert != null &&
+                        (existingAlert.state == Alert.State.ACTIVE || existingAlert.state == Alert.State.ACKNOWLEDGED)
+                    ) {
+                        composedAlert.copy(
+                            id = existingAlert.id,
+                            startTime = existingAlert.startTime,
+                            state = existingAlert.state,
+                            acknowledgedTime = existingAlert.acknowledgedTime,
+                            findingIds = (existingAlert.findingIds + composedAlert.findingIds).distinct(),
+                            relatedDocIds = (existingAlert.relatedDocIds + composedAlert.relatedDocIds).distinct()
+                        )
+                    } else composedAlert
+                    alertsToSave.add(Pair(alert, existingAlert))
+                }
+
+                for ((alert, existingAlert) in alertsToSave) {
+                    for (action in trigger.actions) {
+                        this.runAction(action, triggerCtx.copy(alerts = listOf(AlertContext(alert))), monitor, dryrun)
+                    }
+                    if (!dryrun && monitor.id != Monitor.NO_ID) {
+                        val actionResults = triggerResult.actionResultsMap.getOrDefault(alert.id, emptyMap())
+                        val actionExecutionResults = actionResults.values.map { actionRunResult ->
+                            ActionExecutionResult(actionRunResult.actionId, actionRunResult.executionTime, if (actionRunResult.throttled) 1 else 0)
+                        }
+                        retryPolicy.let {
+                            alertService.saveAlerts(
+                                monitor.dataSources,
+                                listOf(alert.copy(actionExecutionResults = actionExecutionResults)),
+                                it,
+                                allowUpdatingAcknowledgedAlert = existingAlert?.state == Alert.State.ACKNOWLEDGED,
+                                routingId = monitor.id,
+                                refreshAfterWrite = true
+                            )
+                        }
+                    }
+                }
+            } else {
+                // Fallback: non-workflow run or no per-rule finding IDs — original single-alert behavior.
+                val findingIds: List<String> = workflowRunContext?.findingIds ?: listOf()
+                log.info(
+                    "Monitor ${monitor.id} trigger [${trigger.name}]: consolidated path, findingIds=[$findingIds]"
+                )
+
+                val existingAlert = if (!isTempMonitor) {
+                    alertService.loadCurrentAlertsForSingleGroupedDocLevelMonitor(monitor, workflowRunContext)[trigger.id]
+                } else null
+
+                val composedAlert = alertService.composeDocLevelAlert(
+                    findingIds,
+                    triggerResult.triggeredDocs,
+                    triggerCtx,
+                    monitorResult.alertError() ?: triggerResult.alertError(),
+                    executionId = executionId,
+                    workflorwRunContext = workflowRunContext
+                )
+                val alert = if (existingAlert != null &&
+                    (existingAlert.state == Alert.State.ACTIVE || existingAlert.state == Alert.State.ACKNOWLEDGED)
+                ) {
+                    composedAlert.copy(
+                        id = existingAlert.id,
+                        startTime = existingAlert.startTime,
+                        state = existingAlert.state,
+                        acknowledgedTime = existingAlert.acknowledgedTime,
+                        findingIds = (existingAlert.findingIds + composedAlert.findingIds).distinct(),
+                        relatedDocIds = (existingAlert.relatedDocIds + composedAlert.relatedDocIds).distinct()
+                    )
+                } else composedAlert
+                for (action in trigger.actions) {
+                    this.runAction(action, triggerCtx.copy(alerts = listOf(AlertContext(alert))), monitor, dryrun)
+                }
+                if (!dryrun && monitor.id != Monitor.NO_ID) {
+                    val actionResults = triggerResult.actionResultsMap.getOrDefault(alert.id, emptyMap())
+                    val actionExecutionResults = actionResults.values.map { actionRunResult ->
+                        ActionExecutionResult(actionRunResult.actionId, actionRunResult.executionTime, if (actionRunResult.throttled) 1 else 0)
+                    }
+                    retryPolicy.let {
+                        alertService.saveAlerts(
+                            monitor.dataSources,
+                            listOf(alert.copy(actionExecutionResults = actionExecutionResults)),
+                            it,
+                            allowUpdatingAcknowledgedAlert = existingAlert?.state == Alert.State.ACKNOWLEDGED,
+                            routingId = monitor.id,
+                            refreshAfterWrite = true
+                        )
+                    }
                 }
             }
         }
