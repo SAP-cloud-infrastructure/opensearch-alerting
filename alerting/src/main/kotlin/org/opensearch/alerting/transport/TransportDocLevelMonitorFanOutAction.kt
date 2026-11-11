@@ -549,7 +549,9 @@ class TransportDocLevelMonitorFanOutAction
 
                 for ((alert, existingAlert) in alertsToSave) {
                     for (action in trigger.actions) {
-                        this.runAction(action, triggerCtx.copy(alerts = listOf(AlertContext(alert))), monitor, dryrun)
+                        val actionRunResult = this.runAction(action, triggerCtx.copy(alerts = listOf(AlertContext(alert))), monitor, dryrun)
+                        triggerResult.actionResultsMap.getOrPut(alert.id) { mutableMapOf() }
+                        triggerResult.actionResultsMap[alert.id]?.set(action.id, actionRunResult)
                     }
                     if (!dryrun && monitor.id != Monitor.NO_ID) {
                         val actionResults = triggerResult.actionResultsMap.getOrDefault(alert.id, emptyMap())
@@ -600,7 +602,9 @@ class TransportDocLevelMonitorFanOutAction
                     )
                 } else composedAlert
                 for (action in trigger.actions) {
-                    this.runAction(action, triggerCtx.copy(alerts = listOf(AlertContext(alert))), monitor, dryrun)
+                    val actionRunResult = this.runAction(action, triggerCtx.copy(alerts = listOf(AlertContext(alert))), monitor, dryrun)
+                    triggerResult.actionResultsMap.getOrPut(alert.id) { mutableMapOf() }
+                    triggerResult.actionResultsMap[alert.id]?.set(action.id, actionRunResult)
                 }
                 if (!dryrun && monitor.id != Monitor.NO_ID) {
                     val actionResults = triggerResult.actionResultsMap.getOrDefault(alert.id, emptyMap())
