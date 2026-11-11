@@ -114,6 +114,12 @@ class AlertService(
      * (i.e. the chained findings monitor). Returns a map of triggerId → Alert so callers can reuse the
      * existing alert ID and avoid creating a duplicate alert on every execution.
      */
+    /**
+     * Loads existing ACTIVE/ACKNOWLEDGED alerts for a shouldCreateSingleAlertForFindings doc-level
+     * monitor (i.e. the chained findings monitor). Returns a map keyed by
+     * "${triggerId}_${bucketKeyHash}" so per-bucket chained-findings alerts can be deduplicated
+     * independently. Alerts without aggregation data (pre-migration) use a bare triggerId key.
+     */
     suspend fun loadCurrentAlertsForSingleGroupedDocLevelMonitor(
         monitor: Monitor,
         workflowRunContext: WorkflowRunContext?
@@ -121,15 +127,60 @@ class AlertService(
         if (monitor.id.isBlank()) return emptyMap()
         val searchAlertsResponse: SearchResponse = searchAlerts(
             monitor = monitor,
-            size = monitor.triggers.size * 2,
+            size = MAX_SEARCH_SIZE,
             workflowRunContext = workflowRunContext,
             stateFilter = listOf(Alert.State.ACTIVE, Alert.State.ACKNOWLEDGED)
         )
         val foundAlerts = searchAlertsResponse.hits.map { Alert.parse(contentParser(it.sourceRef), it.id, it.version) }
-        foundAlerts.groupBy { it.triggerId }.values.forEach { alerts ->
-            if (alerts.size > 1) logger.warn("Found multiple active alerts for same trigger on chained findings monitor: $alerts")
+        return foundAlerts.associateBy { alert ->
+            val bucketHash = alert.aggregationResultBucket?.getBucketKeysHash()
+            if (bucketHash != null) "${alert.triggerId}_$bucketHash" else alert.triggerId
         }
-        return foundAlerts.associateBy { it.triggerId }
+    }
+
+    /**
+     * Looks up the ACTIVE/ACKNOWLEDGED/AUDIT delegate (bucket-level) alerts whose finding_ids
+     * contain any of the given upstream finding IDs.  Used by the chained-findings fan-out to
+     * recover the AggregationResultBucket for each upstream bucket so it can be forwarded to the
+     * per-bucket chained-findings alert.
+     *
+     * @return map of upstream findingId → AggregationResultBucket for every delegate alert found
+     */
+    suspend fun loadDelegateAlertsByFindingIds(
+        findingIds: List<String>,
+        alertsIndex: String,
+        workflowId: String,
+        excludeMonitorId: String
+    ): Map<String, AggregationResultBucket> {
+        if (findingIds.isEmpty()) return emptyMap()
+        val queryBuilder = QueryBuilders.boolQuery()
+            .must(QueryBuilders.termsQuery("${Alert.FINDING_IDS}.keyword", findingIds))
+            .must(QueryBuilders.termQuery(Alert.WORKFLOW_ID_FIELD, workflowId))
+            .mustNot(QueryBuilders.termQuery(Alert.MONITOR_ID_FIELD, excludeMonitorId))
+            .must(
+                QueryBuilders.termsQuery(
+                    Alert.STATE_FIELD,
+                    listOf(Alert.State.ACTIVE.name, Alert.State.ACKNOWLEDGED.name, Alert.State.AUDIT.name)
+                )
+            )
+        val searchRequest = SearchDataObjectRequest.builder()
+            .indices(alertsIndex)
+            .tenantId(currentTenantId())
+            .searchSourceBuilder(SearchSourceBuilder().size(MAX_SEARCH_SIZE).query(queryBuilder))
+            .build()
+        val searchResponse: SearchResponse = sdkClient.searchDataObjectAsync(searchRequest).await()
+            .searchResponse() ?: return emptyMap()
+        if (searchResponse.status() != RestStatus.OK) return emptyMap()
+
+        val result = mutableMapOf<String, AggregationResultBucket>()
+        for (hit in searchResponse.hits) {
+            val alert = Alert.parse(contentParser(hit.sourceRef), hit.id, hit.version)
+            val aggBucket = alert.aggregationResultBucket ?: continue
+            for (fid in alert.findingIds) {
+                if (fid in findingIds) result[fid] = aggBucket
+            }
+        }
+        return result
     }
 
     suspend fun loadCurrentAlertsForQueryLevelMonitor(monitor: Monitor, workflowRunContext: WorkflowRunContext?): Map<Trigger, Alert?> {
@@ -300,7 +351,8 @@ class AlertService(
         ctx: DocumentLevelTriggerExecutionContext,
         alertError: AlertError?,
         executionId: String,
-        workflorwRunContext: WorkflowRunContext?
+        workflorwRunContext: WorkflowRunContext?,
+        aggregationResultBucket: AggregationResultBucket? = null
     ): Alert {
         val currentTime = Instant.now()
 
@@ -311,12 +363,13 @@ class AlertService(
         } else {
             Alert.State.ERROR
         }
-        return Alert(
+        val alert = Alert(
             id = UUID.randomUUID().toString(), monitor = ctx.monitor, trigger = ctx.trigger, startTime = currentTime,
             lastNotificationTime = currentTime, state = alertState, errorMessage = alertError?.message,
             schemaVersion = IndexUtils.alertIndexSchemaVersion, findingIds = findings, relatedDocIds = relatedDocIds,
             executionId = executionId, workflowId = workflorwRunContext?.workflowId ?: ""
         )
+        return if (aggregationResultBucket != null) alert.copy(aggregationResultBucket = aggregationResultBucket) else alert
     }
 
     fun composeMonitorErrorAlert(
@@ -485,8 +538,18 @@ class AlertService(
         aggResultBuckets.forEach { aggAlertBucket ->
             val currentAlert = currentAlerts[aggAlertBucket.getBucketKeysHash()]
             if (currentAlert != null) {
-                // De-duped Alert
-                dedupedAlerts.add(currentAlert.copy(aggregationResultBucket = aggAlertBucket))
+                // De-duped Alert — update agg bucket and accumulate finding IDs from the current
+                // execution so downstream chained-findings lookups can find this alert by the
+                // latest finding ID (mirrors the doc-level alert merge behaviour).
+                val bucketKey = aggAlertBucket.getBucketKeysHash()
+                val bucketFindingIdsForDedup = findings[bucketKey] ?: findings.values.flatten()
+                val mergedFindingIdsForDedup = (currentAlert.findingIds + bucketFindingIdsForDedup).distinct()
+                dedupedAlerts.add(
+                    currentAlert.copy(
+                        aggregationResultBucket = aggAlertBucket,
+                        findingIds = mergedFindingIdsForDedup
+                    )
+                )
 
                 // Remove de-duped Alert from currentAlerts since it is no longer a candidate for a potentially completed Alert
                 currentAlerts.remove(aggAlertBucket.getBucketKeysHash())

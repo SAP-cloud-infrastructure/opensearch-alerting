@@ -95,6 +95,7 @@ class WorkflowService(
                     // Store finding ID under "finding:<ruleId>" so the chained findings monitor
                     // can look up the per-rule finding ID deterministically via the trigger condition.
                     indexToRelatedDocIdsMap.getOrPut("finding:$ruleId") { mutableListOf() }.add(finding.id)
+                    indexToRelatedDocIdsMap["docs:${finding.id}"] = finding.relatedDocIds.toMutableList()
                 }
                 log.info(
                     "WorkflowService: finding [${finding.id}] monitorId=[${finding.monitorId}] " +
