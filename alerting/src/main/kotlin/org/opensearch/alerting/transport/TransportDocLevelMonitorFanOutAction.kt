@@ -57,12 +57,12 @@ import org.opensearch.alerting.util.MAX_SEARCH_SIZE
 import org.opensearch.alerting.util.MustacheTemplateService
 import org.opensearch.alerting.util.defaultToPerExecutionAction
 import org.opensearch.alerting.util.destinationmigration.NotificationActionConfigs
-import org.opensearch.alerting.util.getBucketKeysHash
 import org.opensearch.alerting.util.destinationmigration.NotificationApiUtils
 import org.opensearch.alerting.util.destinationmigration.getTitle
 import org.opensearch.alerting.util.destinationmigration.publishLegacyNotification
 import org.opensearch.alerting.util.destinationmigration.sendNotification
 import org.opensearch.alerting.util.getActionExecutionPolicy
+import org.opensearch.alerting.util.getBucketKeysHash
 import org.opensearch.alerting.util.getCancelAfterTimeInterval
 import org.opensearch.alerting.util.isAllowed
 import org.opensearch.alerting.util.isTestAction
