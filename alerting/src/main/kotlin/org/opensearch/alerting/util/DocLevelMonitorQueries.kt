@@ -397,6 +397,10 @@ open class DocLevelMonitorQueries(private val client: Client, private val cluste
                         val leafNodeProcessor =
                             fun(fieldName: String, fullPath: String, props: MutableMap<String, Any>):
                                 Triple<String, String, MutableMap<String, Any>> {
+                                // Alias fields (type: alias) must not be renamed: the path they point to
+                                // will be renamed separately by the leaf processor for the target field.
+                                // Renaming an alias field itself (or its path) produces a dangling reference
+                                // that causes "alias must refer to an existing field" on putMapping.
                                 if (props["type"] == "alias") {
                                     return Triple(fieldName, fieldName, mutableMapOf())
                                 }
@@ -437,6 +441,7 @@ open class DocLevelMonitorQueries(private val client: Client, private val cluste
                                 (it.value as Map<String, Any>).containsKey("type") &&
                                 (it.value as Map<String, Any>)["type"] == NESTED
                             ) {
+                                // skip nested — handled by traverseMappingsAndUpdate
                             } else if (
                                 it.value is Map<*, *> &&
                                 (
@@ -444,6 +449,10 @@ open class DocLevelMonitorQueries(private val client: Client, private val cluste
                                         (it.value as Map<String, Any>).isEmpty()
                                     )
                             ) {
+                                // skip alias fields and empty-props entries produced by the alias-skip
+                                // in leafNodeProcessor — they must not be added to updatedProperties
+                                // because putMapping would try to create an alias pointing at a
+                                // non-existent field and reject with "alias must refer to an existing field"
                             } else {
                                 if (updatedProperties.containsKey(it.key) && updatedProperties[it.key] != it.value) {
                                     val mergedField = mergeConflictingFields(
@@ -663,12 +672,16 @@ open class DocLevelMonitorQueries(private val client: Client, private val cluste
                     }
                 }
             } else {
-                // Fast-fail on structural mapping errors that index recreation cannot fix.
+                // Some mapping errors are unrecoverable and retrying (or deleting and recreating
+                // the query index) will not help.  Fast-fail so the caller gets a clear error
+                // rather than a misleading 500 after a silent retry.
+                //   • "alias must refer to an existing field"  — alias path dangling reference
+                //   • "mapper [X] cannot be changed from type [A] to [B]" — type conflict that
+                //     escaped conflict-detection (e.g. alias-field residue in updatedProperties)
                 val isUnrecoverableMappingError = unwrappedException.message?.let {
                     it.contains("alias must refer to an existing field") ||
                         (it.contains("mapper [") && it.contains("cannot be changed from type"))
                 } ?: false
-
                 if (isUnrecoverableMappingError) {
                     log.error(
                         "Unrecoverable mapping error on queryIndex $targetQueryIndex — " +
@@ -676,7 +689,6 @@ open class DocLevelMonitorQueries(private val client: Client, private val cluste
                     )
                     throw AlertingException.wrap(unwrappedException)
                 }
-
                 // retry with deleting query index
                 if (monitor.deleteQueryIndexInEveryRun == true) {
                     try {
