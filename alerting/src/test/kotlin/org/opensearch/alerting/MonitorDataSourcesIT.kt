@@ -21,6 +21,7 @@ import org.opensearch.action.admin.indices.refresh.RefreshRequest
 import org.opensearch.action.admin.indices.settings.get.GetSettingsResponse
 import org.opensearch.action.bulk.BulkRequest
 import org.opensearch.action.bulk.BulkResponse
+import org.opensearch.action.delete.DeleteRequest
 import org.opensearch.action.fieldcaps.FieldCapabilitiesRequest
 import org.opensearch.action.index.IndexRequest
 import org.opensearch.action.search.SearchRequest
@@ -6607,7 +6608,7 @@ class MonitorDataSourcesIT : AlertingSingleNodeTestCase() {
      * Failure signature without fix: chainedFindings.size == 0 after a single workflow execution.
      */
     fun `test chained findings monitor fires in same execution regardless of finding volume`() {
-        val testIndex = createTestIndex()
+        val testIndex = index
 
         // Monitor 1 (delegate): matches all documents in testIndex.
         val delegateQuery = DocLevelQuery(query = "test_field:\"match\"", name = "q1", fields = listOf())
@@ -6674,5 +6675,120 @@ class MonitorDataSourcesIT : AlertingSingleNodeTestCase() {
                 "stale findings from a previous run instead of findings from the current execution.",
             chainedFindingsInCurrentExec.isNotEmpty()
         )
+    }
+
+    @Throws(Exception::class)
+    fun `test per-bucket chained findings alert completes when bucket stops generating findings`() {
+        val testIndex = index
+        val sharedAlertsIndex = "custom-alerts-per-bucket-test"
+        val bucketFindingsIndex = "custom-findings-per-bucket-test"
+        val bucketFindingsIndexPattern = "custom-findings-per-bucket-test-1"
+
+        // Bucket-level delegate: aggregate by test_field_1 (keyword field in createTestIndex mapping).
+        val compositeSources = listOf(TermsValuesSourceBuilder("test_field_1").field("test_field_1"))
+        val compositeAgg = CompositeAggregationBuilder("composite_agg", compositeSources)
+        val bucketInput = SearchInput(
+            indices = listOf(testIndex),
+            query = SearchSourceBuilder().size(0).query(QueryBuilders.matchAllQuery()).aggregation(compositeAgg)
+        )
+        val bucketTrigger = randomBucketLevelTrigger().let { t ->
+            t.copy(
+                bucketSelector = BucketSelectorExtAggregationBuilder(
+                    name = t.id,
+                    bucketsPathsMap = mapOf("docCount" to "_count"),
+                    script = Script("params.docCount >= 1"),
+                    parentBucketPath = "composite_agg",
+                    filter = null,
+                )
+            )
+        }
+        val bucketMonitorResponse = createMonitor(
+            randomBucketLevelMonitor(
+                inputs = listOf(bucketInput),
+                enabled = false,
+                triggers = listOf(bucketTrigger),
+                dataSources = DataSources(
+                    findingsEnabled = true,
+                    alertsIndex = sharedAlertsIndex,
+                    findingsIndex = bucketFindingsIndex,
+                    findingsIndexPattern = bucketFindingsIndexPattern
+                )
+            )
+        )!!
+
+        // Chained doc-level monitor with shouldCreateSingleAlertForFindings = true.
+        // The DocLevelQuery tag must equal the bucket trigger ID so that
+        // runForEachDocTriggerCreateSingleGroupedAlert extracts the conditionRuleId correctly
+        // and looks up per-rule finding IDs → activating the per-bucket alert path.
+        val chainedQuery = DocLevelQuery(
+            query = "test_field_1:\"A\" OR test_field_1:\"B\"",
+            name = "q1",
+            tags = listOf(bucketTrigger.id),
+            fields = listOf()
+        )
+        val chainedTrigger = randomDocumentLevelTrigger(condition = Script("(query[tag=${bucketTrigger.id}])"))
+        val chainedMonitorResponse = createMonitor(
+            randomDocumentLevelMonitor(
+                inputs = listOf(DocLevelMonitorInput("", listOf(testIndex), listOf(chainedQuery))),
+                triggers = listOf(chainedTrigger),
+                dataSources = DataSources(alertsIndex = sharedAlertsIndex),
+                ignoreFindingsAndAlerts = true
+            )
+        )!!
+
+        val workflowResponse = upsertWorkflow(
+            randomWorkflow(
+                monitorIds = listOf(bucketMonitorResponse.id, chainedMonitorResponse.id),
+                enabled = false,
+                auditDelegateMonitorAlerts = false
+            )
+        )!!
+        val workflowById = searchWorkflow(workflowResponse.id)!!
+
+        // --- Execution 1: both bucket A and bucket B are active ---
+        indexDoc(testIndex, "1", """{"test_field_1": "A"}""")
+        indexDoc(testIndex, "2", """{"test_field_1": "A"}""")
+        indexDoc(testIndex, "3", """{"test_field_1": "B"}""")
+        indexDoc(testIndex, "4", """{"test_field_1": "B"}""")
+
+        executeWorkflow(workflowById, workflowResponse.id, false)
+
+        val alertsAfterRun1 = searchAlerts(chainedMonitorResponse.id, sharedAlertsIndex)
+            .filter { it.state == Alert.State.ACTIVE }
+        assertEquals(
+            "Expected 2 ACTIVE per-bucket chained alerts after first execution (one for A, one for B)",
+            2, alertsAfterRun1.size
+        )
+
+        // --- Simulate bucket B going inactive (e.g. data-stream rollover): remove its documents ---
+        client().delete(
+            DeleteRequest(testIndex, "3").setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE)
+        ).get()
+        client().delete(
+            DeleteRequest(testIndex, "4").setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE)
+        ).get()
+
+        // --- Execution 2: only bucket A produces findings ---
+        executeWorkflow(workflowById, workflowResponse.id, false)
+
+        val alertsAfterRun2 = searchAlerts(chainedMonitorResponse.id, sharedAlertsIndex)
+        val activeAlerts = alertsAfterRun2.filter { it.state == Alert.State.ACTIVE }
+        val completedAlerts = alertsAfterRun2.filter { it.state == Alert.State.COMPLETED }
+
+        assertEquals(
+            "Expected exactly 1 ACTIVE chained alert (bucket A) after second execution",
+            1, activeAlerts.size
+        )
+        assertEquals(
+            "Expected exactly 1 COMPLETED chained alert (bucket B) after second execution — " +
+                "completeOpenAlertsIfTriggerCleared must detect that bucket B has no active findings " +
+                "and complete its per-bucket alert",
+            1, completedAlerts.size
+        )
+
+        val activeBucketKeys = activeAlerts.first().aggregationResultBucket?.bucketKeys
+        val completedBucketKeys = completedAlerts.first().aggregationResultBucket?.bucketKeys
+        assertTrue("Active alert should be for bucket A", activeBucketKeys?.contains("A") == true)
+        assertTrue("Completed alert should be for bucket B", completedBucketKeys?.contains("B") == true)
     }
 }
