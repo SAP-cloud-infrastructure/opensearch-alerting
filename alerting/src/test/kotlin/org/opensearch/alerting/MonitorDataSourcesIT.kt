@@ -6802,4 +6802,134 @@ class MonitorDataSourcesIT : AlertingSingleNodeTestCase() {
         assertTrue("Active alert should be for bucket A", activeBucketKeys?.contains("A") == true)
         assertTrue("Completed alert should be for bucket B", completedBucketKeys?.contains("B") == true)
     }
+
+    @Throws(Exception::class)
+    fun `test ACKNOWLEDGED per-bucket chained findings alert completes when bucket stops generating findings`() {
+        val testIndex = index
+        val sharedAlertsIndex = "custom-alerts-per-bucket-ack-test"
+        val chainedAlertsHistoryIndex = "custom-alerts-per-bucket-ack-test-history"
+        val chainedAlertsHistoryIndexPattern = "<custom-alerts-per-bucket-ack-test-history-{now/d}-1>"
+        val bucketFindingsIndex = "custom-findings-per-bucket-ack-test"
+        val bucketFindingsIndexPattern = "custom-findings-per-bucket-ack-test-1"
+
+        val compositeSources = listOf(TermsValuesSourceBuilder("test_field_1").field("test_field_1"))
+        val compositeAgg = CompositeAggregationBuilder("composite_agg", compositeSources)
+        val bucketInput = SearchInput(
+            indices = listOf(testIndex),
+            query = SearchSourceBuilder().size(0).query(QueryBuilders.matchAllQuery()).aggregation(compositeAgg)
+        )
+        val bucketTrigger = randomBucketLevelTrigger().let { t ->
+            t.copy(
+                bucketSelector = BucketSelectorExtAggregationBuilder(
+                    name = t.id,
+                    bucketsPathsMap = mapOf("docCount" to "_count"),
+                    script = Script("params.docCount >= 1"),
+                    parentBucketPath = "composite_agg",
+                    filter = null,
+                )
+            )
+        }
+        val bucketMonitorResponse = createMonitor(
+            randomBucketLevelMonitor(
+                inputs = listOf(bucketInput),
+                enabled = false,
+                triggers = listOf(bucketTrigger),
+                dataSources = DataSources(
+                    findingsEnabled = true,
+                    alertsIndex = sharedAlertsIndex,
+                    findingsIndex = bucketFindingsIndex,
+                    findingsIndexPattern = bucketFindingsIndexPattern
+                )
+            )
+        )!!
+
+        val chainedQuery = DocLevelQuery(
+            id = bucketTrigger.id,
+            query = "test_field_1:\"A\" OR test_field_1:\"B\"",
+            name = "q1",
+            tags = listOf(bucketTrigger.id),
+            fields = listOf()
+        )
+        val chainedTrigger = randomDocumentLevelTrigger(condition = Script("(query[tag=${bucketTrigger.id}])"))
+        val chainedMonitorResponse = createMonitor(
+            randomDocumentLevelMonitor(
+                inputs = listOf(DocLevelMonitorInput("", listOf(testIndex), listOf(chainedQuery))),
+                triggers = listOf(chainedTrigger),
+                dataSources = DataSources(
+                    alertsIndex = sharedAlertsIndex,
+                    alertsHistoryIndex = chainedAlertsHistoryIndex,
+                    alertsHistoryIndexPattern = chainedAlertsHistoryIndexPattern
+                ),
+                ignoreFindingsAndAlerts = true
+            )
+        )!!
+
+        val workflowResponse = upsertWorkflow(
+            randomWorkflow(
+                monitorIds = listOf(bucketMonitorResponse.id, chainedMonitorResponse.id),
+                enabled = false,
+                auditDelegateMonitorAlerts = false
+            )
+        )!!
+        val workflowById = searchWorkflow(workflowResponse.id)!!
+
+        // --- Execution 1: both bucket A and bucket B are active ---
+        indexDoc(testIndex, "1", """{"test_field_1": "A"}""")
+        indexDoc(testIndex, "2", """{"test_field_1": "A"}""")
+        indexDoc(testIndex, "3", """{"test_field_1": "B"}""")
+        indexDoc(testIndex, "4", """{"test_field_1": "B"}""")
+
+        executeWorkflow(workflowById, workflowResponse.id, false)
+
+        val alertsAfterRun1 = searchAlerts(chainedMonitorResponse.id, sharedAlertsIndex)
+            .filter { it.state == Alert.State.ACTIVE }
+        assertEquals(
+            "Expected 2 ACTIVE per-bucket chained alerts after first execution",
+            2, alertsAfterRun1.size
+        )
+
+        // --- Acknowledge the per-bucket alert for bucket B ---
+        val bAlert = alertsAfterRun1.first { it.aggregationResultBucket?.bucketKeys?.contains("B") == true }
+        val ackResponse = ackChainedAlerts(listOf(bAlert.id), workflowResponse.id)
+        assertEquals("Acknowledgement should succeed", 1, ackResponse.acknowledged.size)
+
+        // --- Simulate bucket B going inactive: remove its documents ---
+        client().delete(
+            DeleteRequest(testIndex, "3").setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE)
+        ).get()
+        client().delete(
+            DeleteRequest(testIndex, "4").setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE)
+        ).get()
+
+        // --- Execution 2: only bucket A produces findings ---
+        executeWorkflow(workflowById, workflowResponse.id, false)
+
+        val alertsAfterRun2 = searchAlerts(chainedMonitorResponse.id, sharedAlertsIndex)
+        val historyAlertsAfterRun2 = searchAlerts(chainedMonitorResponse.id, chainedAlertsHistoryIndex)
+        val activeAlerts = alertsAfterRun2.filter { it.state == Alert.State.ACTIVE }
+        val acknowledgedAlerts = alertsAfterRun2.filter { it.state == Alert.State.ACKNOWLEDGED }
+        val completedAlerts = historyAlertsAfterRun2.filter { it.state == Alert.State.COMPLETED }
+
+        assertEquals(
+            "Expected exactly 1 ACTIVE chained alert (bucket A) after second execution",
+            1, activeAlerts.size
+        )
+        assertEquals(
+            "ACKNOWLEDGED alert for bucket B must be removed from the active index once completed",
+            0, acknowledgedAlerts.size
+        )
+        assertEquals(
+            "Expected exactly 1 COMPLETED chained alert (previously ACKNOWLEDGED bucket B) — " +
+                "completeOpenAlertsIfTriggerCleared must complete ACKNOWLEDGED alerts when their bucket clears",
+            1, completedAlerts.size
+        )
+
+        val activeBucketKeys = activeAlerts.first().aggregationResultBucket?.bucketKeys
+        val completedBucketKeys = completedAlerts.first().aggregationResultBucket?.bucketKeys
+        assertTrue("Active alert should be for bucket A", activeBucketKeys?.contains("A") == true)
+        assertTrue(
+            "Completed alert should be for bucket B (was ACKNOWLEDGED before bucket cleared)",
+            completedBucketKeys?.contains("B") == true
+        )
+    }
 }
