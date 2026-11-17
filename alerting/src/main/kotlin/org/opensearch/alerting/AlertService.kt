@@ -153,6 +153,10 @@ class AlertService(
         excludeMonitorId: String
     ): Map<String, AggregationResultBucket> {
         if (findingIds.isEmpty()) return emptyMap()
+        // Refresh the alerts index so that delegate alerts written earlier in this workflow
+        // execution are visible before we search. Mirrors the refresh in
+        // getFindingDocIdsByExecutionId for the findings index.
+        client.suspendUntil { execute(RefreshAction.INSTANCE, RefreshRequest(alertsIndex), it) }
         val queryBuilder = QueryBuilders.boolQuery()
             .must(QueryBuilders.termsQuery("${Alert.FINDING_IDS}.keyword", findingIds))
             .must(QueryBuilders.termQuery(Alert.WORKFLOW_ID_FIELD, workflowId))
