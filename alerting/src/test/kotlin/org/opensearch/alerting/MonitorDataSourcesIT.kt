@@ -6591,4 +6591,88 @@ class MonitorDataSourcesIT : AlertingSingleNodeTestCase() {
         val lastRunContextAfterEnable = (monitorMetadata?.lastRunContext?.get(index) as? Map<String, Any>)
         assertEquals(3, lastRunContextAfterEnable?.get("0"))
     }
+
+    /**
+     * Regression test for: findings-index refresh race between delegate writes and chained query.
+     *
+     * Before the fix, all delegate monitors wrote findings to the index with no guaranteed refresh
+     * before CompositeWorkflowRunner called getFindingDocIdsByExecutionId().  The chained monitor
+     * received an empty matchingDocIdsPerIndex and produced zero findings in the same execution.
+     * The chained monitor's findings only appeared on the NEXT scheduled run (up to 1 hour later
+     * in production).
+     *
+     * The fix: WorkflowService.getFindingDocIdsByExecutionId() now awaits a refresh of the findings
+     * index before querying, guaranteeing that all delegate writes are visible at query time.
+     *
+     * Failure signature without fix: chainedFindings.size == 0 after a single workflow execution.
+     */
+    fun `test chained findings monitor fires in same execution regardless of finding volume`() {
+        val testIndex = createTestIndex()
+
+        // Monitor 1 (delegate): matches all documents in testIndex.
+        val delegateQuery = DocLevelQuery(query = "test_field:\"match\"", name = "q1", fields = listOf())
+        val delegateMonitorResponse = createMonitor(
+            randomDocumentLevelMonitor(
+                inputs = listOf(DocLevelMonitorInput("", listOf(testIndex), listOf(delegateQuery))),
+                triggers = listOf(randomDocumentLevelTrigger(condition = ALWAYS_RUN))
+            )
+        )!!
+
+        // Monitor 2 (chained): uses the same query; its input is filtered to documents found by monitor 1.
+        val chainedQuery = DocLevelQuery(query = "test_field:\"match\"", name = "q2", fields = listOf())
+        val chainedMonitorResponse = createMonitor(
+            randomDocumentLevelMonitor(
+                inputs = listOf(DocLevelMonitorInput("", listOf(testIndex), listOf(chainedQuery))),
+                triggers = listOf(randomDocumentLevelTrigger(condition = ALWAYS_RUN))
+            )
+        )!!
+
+        // Workflow: monitor 2 chains from monitor 1.
+        val workflow = randomWorkflow(
+            monitorIds = listOf(delegateMonitorResponse.id, chainedMonitorResponse.id),
+            enabled = false
+        )
+        val workflowResponse = upsertWorkflow(workflow)!!
+        val workflowById = searchWorkflow(workflowResponse.id)
+        assertNotNull("Workflow not found after creation", workflowById)
+
+        // Index enough documents to make the bulk findings write non-trivial.
+        // Without the fix, getFindingDocIdsByExecutionId() queries before the findings index is
+        // refreshed, returning empty results regardless of document volume.
+        val docCount = 300
+        val bulkRequest = BulkRequest().setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE)
+        repeat(docCount) { i ->
+            bulkRequest.add(
+                IndexRequest(testIndex).id(i.toString())
+                    .source("""{"test_field":"match"}""", XContentType.JSON)
+            )
+        }
+        client().bulk(bulkRequest).get()
+
+        // Execute the workflow exactly once.
+        val execResponse = executeWorkflow(workflowById, workflowResponse.id, false)
+        assertNotNull("Workflow execution returned null", execResponse)
+
+        // The chained monitor must produce findings from THIS single execution.
+        // Without the fix it produces 0 findings (sees empty matchingDocIdsPerIndex because
+        // the findings index was not refreshed before getFindingDocIdsByExecutionId queried it).
+        val chainedFindings = searchFindings(chainedMonitorResponse.id)
+        assertTrue(
+            "Chained findings monitor produced no findings in the same execution — " +
+                "likely caused by the findings-index not being refreshed before getFindingDocIdsByExecutionId queried it. " +
+                "Expected >= 1 finding, got 0.",
+            chainedFindings.isNotEmpty()
+        )
+
+        // Verify the chained findings reference documents from the same execution,
+        // not from a deferred run.
+        val executionId = execResponse!!.workflowRunResult.executionId
+        val chainedFindingsInCurrentExec = chainedFindings.filter { it.executionId == executionId }
+        assertTrue(
+            "Chained findings were generated (count=${chainedFindings.size}) but none belong to " +
+                "the current executionId=$executionId. This indicates the chained monitor picked up " +
+                "stale findings from a previous run instead of findings from the current execution.",
+            chainedFindingsInCurrentExec.isNotEmpty()
+        )
+    }
 }
