@@ -9,6 +9,8 @@ import org.apache.logging.log4j.LogManager
 import org.opensearch.OpenSearchException
 import org.opensearch.action.admin.indices.exists.indices.IndicesExistsRequest
 import org.opensearch.action.admin.indices.exists.indices.IndicesExistsResponse
+import org.opensearch.action.admin.indices.refresh.RefreshAction
+import org.opensearch.action.admin.indices.refresh.RefreshRequest
 import org.opensearch.action.search.SearchRequest
 import org.opensearch.action.search.SearchResponse
 import org.opensearch.alerting.opensearchapi.suspendUntil
@@ -52,6 +54,7 @@ class WorkflowService(
                 exists(IndicesExistsRequest(dataSources.findingsIndex).local(true), it)
             }
             if (existsResponse.isExists == false) return Pair(emptyMap(), listOf())
+            client.suspendUntil { execute(RefreshAction.INSTANCE, RefreshRequest(dataSources.findingsIndex), it) }
             // Search findings index to match id of monitors and workflow execution id
             val bqb = QueryBuilders.boolQuery()
                 .filter(
