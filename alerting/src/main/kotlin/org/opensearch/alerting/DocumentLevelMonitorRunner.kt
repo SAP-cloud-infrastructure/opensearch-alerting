@@ -12,6 +12,7 @@ import org.opensearch.action.ActionListenerResponseHandler
 import org.opensearch.action.bulk.BackoffPolicy
 import org.opensearch.action.support.GroupedActionListener
 import org.opensearch.alerting.util.IndexUtils
+import org.opensearch.alerting.util.getBucketKeysHash
 import org.opensearch.cluster.metadata.IndexMetadata
 import org.opensearch.cluster.node.DiscoveryNode
 import org.opensearch.cluster.routing.ShardRouting
@@ -465,24 +466,44 @@ class DocumentLevelMonitorRunner : MonitorRunner() {
         alertService: AlertService,
         retryPolicy: BackoffPolicy
     ) {
-        // All triggers fired — nothing to complete. Avoid the search entirely.
-        val clearedTriggerIds = triggerResults.entries
-            .filter { it.value.triggeredDocs.isEmpty() }
-            .map { it.key }
-        if (clearedTriggerIds.isEmpty()) return
-
         val existingAlerts = alertService.loadCurrentAlertsForSingleGroupedDocLevelMonitor(monitor, workflowRunContext)
-        for (triggerId in clearedTriggerIds) {
-            val existing = existingAlerts[triggerId] ?: continue
-            if (existing.state != Alert.State.ACTIVE && existing.state != Alert.State.ACKNOWLEDGED) continue
+        if (existingAlerts.isEmpty()) return
+
+        // For per-bucket alerts: determine which bucket key hashes are still active in this execution
+        // by querying the delegate alerts that contain the current execution's finding IDs.
+        // A bucket is "active" if its delegate alert holds at least one finding from this run.
+        // Using finding IDs (not alert state) avoids false positives from alerts index refresh lag.
+        val activeBucketHashes: Set<String> = if (!workflowRunContext?.findingIds.isNullOrEmpty()) {
+            alertService.loadDelegateAlertsByFindingIds(
+                workflowRunContext!!.findingIds!!,
+                monitor.dataSources.alertsIndex,
+                workflowRunContext.workflowId,
+                excludeMonitorId = monitor.id
+            ).values.map { it.getBucketKeysHash() }.toSet()
+        } else emptySet()
+
+        for ((_, existingAlert) in existingAlerts) {
+            if (existingAlert.state != Alert.State.ACTIVE && existingAlert.state != Alert.State.ACKNOWLEDGED) continue
+            val triggerResult = triggerResults[existingAlert.triggerId]
+            val bucket = existingAlert.aggregationResultBucket
+            val shouldComplete = when {
+                // Case 1: trigger produced no documents at all in this execution.
+                triggerResult == null || triggerResult.triggeredDocs.isEmpty() -> true
+                // Case 2: trigger still fires overall but this specific bucket had no findings
+                // (e.g. a data-stream backing index rolled over and the old index is now inactive).
+                bucket != null && activeBucketHashes.isNotEmpty() ->
+                    bucket.getBucketKeysHash() !in activeBucketHashes
+                else -> false
+            }
+            if (!shouldComplete) continue
             logger.info(
-                "Monitor ${monitor.id} trigger [$triggerId]: trigger cleared, completing alert ${existing.id}"
+                "Monitor ${monitor.id} trigger [${existingAlert.triggerId}]: completing alert ${existingAlert.id} (bucket cleared)"
             )
             alertService.saveAlerts(
                 monitor.dataSources,
-                listOf(existing.copy(state = Alert.State.COMPLETED, endTime = Instant.now(), errorMessage = null)),
+                listOf(existingAlert.copy(state = Alert.State.COMPLETED, endTime = Instant.now(), errorMessage = null)),
                 retryPolicy,
-                allowUpdatingAcknowledgedAlert = existing.state == Alert.State.ACKNOWLEDGED,
+                allowUpdatingAcknowledgedAlert = existingAlert.state == Alert.State.ACKNOWLEDGED,
                 routingId = monitor.id
             )
         }
