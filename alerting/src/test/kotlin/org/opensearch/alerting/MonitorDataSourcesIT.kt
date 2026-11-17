@@ -6681,6 +6681,8 @@ class MonitorDataSourcesIT : AlertingSingleNodeTestCase() {
     fun `test per-bucket chained findings alert completes when bucket stops generating findings`() {
         val testIndex = index
         val sharedAlertsIndex = "custom-alerts-per-bucket-test"
+        val chainedAlertsHistoryIndex = "custom-alerts-per-bucket-test-history"
+        val chainedAlertsHistoryIndexPattern = "<custom-alerts-per-bucket-test-history-{now/d}-1>"
         val bucketFindingsIndex = "custom-findings-per-bucket-test"
         val bucketFindingsIndexPattern = "custom-findings-per-bucket-test-1"
 
@@ -6717,10 +6719,14 @@ class MonitorDataSourcesIT : AlertingSingleNodeTestCase() {
         )!!
 
         // Chained doc-level monitor with shouldCreateSingleAlertForFindings = true.
-        // The DocLevelQuery tag must equal the bucket trigger ID so that
-        // runForEachDocTriggerCreateSingleGroupedAlert extracts the conditionRuleId correctly
-        // and looks up per-rule finding IDs → activating the per-bucket alert path.
+        // The DocLevelQuery ID must equal the bucket trigger ID so that the
+        // shouldCreateSingleAlertForFindings fast-path (which looks up ruleDocIds by dlq.id in
+        // matchingDocIdsPerIndex) finds the upstream doc IDs. The tag also equals the trigger ID
+        // so that runForEachDocTriggerCreateSingleGroupedAlert can extract conditionRuleId and
+        // look up the per-rule finding IDs for the per-bucket alert path.
+        // This mirrors how SA sets up chained monitors: DocLevelQuery.id = SA rule id = bucket trigger id.
         val chainedQuery = DocLevelQuery(
+            id = bucketTrigger.id,
             query = "test_field_1:\"A\" OR test_field_1:\"B\"",
             name = "q1",
             tags = listOf(bucketTrigger.id),
@@ -6731,7 +6737,11 @@ class MonitorDataSourcesIT : AlertingSingleNodeTestCase() {
             randomDocumentLevelMonitor(
                 inputs = listOf(DocLevelMonitorInput("", listOf(testIndex), listOf(chainedQuery))),
                 triggers = listOf(chainedTrigger),
-                dataSources = DataSources(alertsIndex = sharedAlertsIndex),
+                dataSources = DataSources(
+                    alertsIndex = sharedAlertsIndex,
+                    alertsHistoryIndex = chainedAlertsHistoryIndex,
+                    alertsHistoryIndexPattern = chainedAlertsHistoryIndexPattern
+                ),
                 ignoreFindingsAndAlerts = true
             )
         )!!
@@ -6772,8 +6782,9 @@ class MonitorDataSourcesIT : AlertingSingleNodeTestCase() {
         executeWorkflow(workflowById, workflowResponse.id, false)
 
         val alertsAfterRun2 = searchAlerts(chainedMonitorResponse.id, sharedAlertsIndex)
+        val historyAlertsAfterRun2 = searchAlerts(chainedMonitorResponse.id, chainedAlertsHistoryIndex)
         val activeAlerts = alertsAfterRun2.filter { it.state == Alert.State.ACTIVE }
-        val completedAlerts = alertsAfterRun2.filter { it.state == Alert.State.COMPLETED }
+        val completedAlerts = historyAlertsAfterRun2.filter { it.state == Alert.State.COMPLETED }
 
         assertEquals(
             "Expected exactly 1 ACTIVE chained alert (bucket A) after second execution",
