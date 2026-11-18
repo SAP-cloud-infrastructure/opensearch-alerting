@@ -445,18 +445,17 @@ class DocumentLevelMonitorRunner : MonitorRunner() {
     }
 
     /**
-     * After all fan-out responses are aggregated, decide whether open alerts should be completed.
+     * After all fan-out responses are aggregated, decide whether open alerts should be completed
+     * for triggers that fired no documents in this execution.
      *
-     * A fan-out only sees one concrete backing index at a time and cannot distinguish "no docs on
-     * this index" from "the trigger is globally clear." This coordinator check runs once per
-     * execution, after all fan-outs, using the fully-merged triggeredDocs to make the right call:
-     *   - triggeredDocs non-empty → trigger still fires somewhere; leave the alert open.
-     *   - triggeredDocs empty + open alert exists → condition has cleared; complete it.
-     *
-     * Alert creation stays in the fan-out (TransportDocLevelMonitorFanOutAction) because
-     * actions/notifications must fire on the node that evaluated the trigger. Moving creation
-     * here would require DocumentLevelTriggerRunResult (opensearch-alerting-commons) to carry the
-     * composed alert back — a commons change outside the scope of this fix.
+     * Per-bucket bucket-cleared completion (when the trigger still fires on OTHER buckets) is
+     * handled in TransportDocLevelMonitorFanOutAction.runForEachDocTriggerCreateSingleGroupedAlert
+     * where the complete bucketToFindings map is available.  Bucket keys can be any aggregation
+     * field value (username, IP, project, …) — not necessarily an index name — so the coordinator
+     * level does not have enough information to distinguish them.  Each fan-out receives the same
+     * workflowRunContext (populated from all shards before dispatch), so its bucketToFindings is
+     * the global active-bucket set, and concurrent completions across fan-outs are safe because
+     * saveAlerts(COMPLETED) is a delete from the active index — idempotent under concurrent calls.
      */
     private suspend fun completeOpenAlertsIfTriggerCleared(
         monitor: Monitor,
@@ -468,27 +467,14 @@ class DocumentLevelMonitorRunner : MonitorRunner() {
         val existingAlerts = alertService.loadCurrentAlertsForSingleGroupedDocLevelMonitor(monitor, workflowRunContext)
         if (existingAlerts.isEmpty()) return
 
-        // The fan-out already updated per-bucket chained alerts for active buckets with
-        // refreshAfterWrite=true, stamping the current execution's finding IDs into those alerts.
-        // An existing per-bucket alert whose findingIds contains none of the current execution's
-        // finding IDs was not touched by the fan-out → its bucket is no longer active → complete it.
-        val activeFindingIds: Set<String> = workflowRunContext?.findingIds?.toSet() ?: emptySet()
-
         for ((_, existingAlert) in existingAlerts) {
             if (existingAlert.state != Alert.State.ACTIVE && existingAlert.state != Alert.State.ACKNOWLEDGED) continue
             val triggerResult = triggerResults[existingAlert.triggerId]
-            val shouldComplete = when {
-                // Case 1: trigger produced no documents at all in this execution.
-                triggerResult == null || triggerResult.triggeredDocs.isEmpty() -> true
-                // Case 2: trigger still fires overall but this specific bucket had no findings
-                // (e.g. a data-stream backing index rolled over and the old index is now inactive).
-                existingAlert.aggregationResultBucket != null && activeFindingIds.isNotEmpty() ->
-                    existingAlert.findingIds.none { it in activeFindingIds }
-                else -> false
-            }
-            if (!shouldComplete) continue
+            // Only complete when the trigger produced no documents at all in this execution.
+            // When the trigger still fires (some buckets active) the fan-out handles per-bucket completion.
+            if (triggerResult != null && triggerResult.triggeredDocs.isNotEmpty()) continue
             logger.info(
-                "Monitor ${monitor.id} trigger [${existingAlert.triggerId}]: completing alert ${existingAlert.id} (bucket cleared)"
+                "Monitor ${monitor.id} trigger [${existingAlert.triggerId}]: completing alert ${existingAlert.id} (trigger cleared)"
             )
             alertService.saveAlerts(
                 monitor.dataSources,

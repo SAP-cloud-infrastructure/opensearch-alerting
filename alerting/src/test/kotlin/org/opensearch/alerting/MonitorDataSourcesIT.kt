@@ -6801,6 +6801,20 @@ class MonitorDataSourcesIT : AlertingSingleNodeTestCase() {
         val completedBucketKeys = completedAlerts.first().aggregationResultBucket?.bucketKeys
         assertTrue("Active alert should be for bucket A", activeBucketKeys?.contains("A") == true)
         assertTrue("Completed alert should be for bucket B", completedBucketKeys?.contains("B") == true)
+
+        // Verify that bucket A's alert is the *same* alert object (same ID) across both executions
+        // and that its finding_ids have been accumulated rather than replaced.
+        val aAlertRun1 = alertsAfterRun1.first { it.aggregationResultBucket?.bucketKeys?.contains("A") == true }
+        val aAlertRun2 = activeAlerts.first()
+        assertEquals(
+            "Bucket A alert must keep the same ID across executions (no spurious complete+recreate)",
+            aAlertRun1.id, aAlertRun2.id
+        )
+        assertTrue(
+            "Bucket A alert must accumulate finding_ids across executions: " +
+                "run-2 count (${aAlertRun2.findingIds.size}) must exceed run-1 count (${aAlertRun1.findingIds.size})",
+            aAlertRun2.findingIds.size > aAlertRun1.findingIds.size
+        )
     }
 
     @Throws(Exception::class)

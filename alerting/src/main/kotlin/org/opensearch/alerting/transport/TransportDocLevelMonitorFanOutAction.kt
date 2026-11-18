@@ -136,6 +136,11 @@ import java.util.stream.Collectors
 private val log = LogManager.getLogger(TransportDocLevelMonitorFanOutAction::class.java)
 private val scope: CoroutineScope = CoroutineScope(Dispatchers.IO)
 
+// Maximum number of source document IDs accumulated on a shouldCreateSingleAlertForFindings alert.
+// Keeps the alert document bounded (~262 KB at 10k × 22-char IDs); the full list is always
+// derivable from the findings index (retained 365 days in SCI).
+private const val MAX_ACCUMULATED_RELATED_DOC_IDS = 10_000
+
 class TransportDocLevelMonitorFanOutAction
 @Inject constructor(
     transportService: TransportService,
@@ -489,10 +494,16 @@ class TransportDocLevelMonitorFanOutAction
                     // Per-bucket related docs: collect all source document IDs for this bucket's findings.
                     // triggeredDocs for the chained findings monitor contains finding IDs (not source doc IDs),
                     // so intersecting them with source doc IDs always yields empty. Use bucketDocIds directly.
-                    val bucketDocIds: List<String> = bucketFindingIds.flatMap { fid ->
-                        workflowRunContext.matchingDocIdsPerIndex["docs:$fid"] ?: emptyList()
-                    }
-                    val perBucketTriggeredDocs: List<String> = bucketDocIds.ifEmpty { triggerResult.triggeredDocs }
+                    // Use a lazy sequence + early-terminating take so we never materialise more than
+                    // MAX_ACCUMULATED_RELATED_DOC_IDS entries even when bucketFindingIds is very large.
+                    val bucketDocIds: List<String> = bucketFindingIds.asSequence()
+                        .flatMap { fid ->
+                            (workflowRunContext.matchingDocIdsPerIndex["docs:$fid"] ?: emptyList()).asSequence()
+                        }
+                        .take(MAX_ACCUMULATED_RELATED_DOC_IDS)
+                        .toList()
+                    val perBucketTriggeredDocs: List<String> = bucketDocIds
+                        .ifEmpty { triggerResult.triggeredDocs.take(MAX_ACCUMULATED_RELATED_DOC_IDS) }
 
                     val existingAlert = existingAlerts["${trigger.id}_$bucketKeyHash"]
                     val composedAlert = alertService.composeDocLevelAlert(
@@ -507,6 +518,11 @@ class TransportDocLevelMonitorFanOutAction
                     val alert = if (existingAlert != null &&
                         (existingAlert.state == Alert.State.ACTIVE || existingAlert.state == Alert.State.ACKNOWLEDGED)
                     ) {
+                        val existingCount = (existingAlert.aggregationResultBucket?.bucket?.get("doc_count") as? Number)?.toLong() ?: 0L
+                        val currentCount = (composedAlert.aggregationResultBucket?.bucket?.get("doc_count") as? Number)?.toLong() ?: 0L
+                        val accumulatedAggBucket = composedAlert.aggregationResultBucket?.let { agg ->
+                            agg.copy(bucket = agg.bucket?.plus("doc_count" to (existingCount + currentCount)))
+                        }
                         composedAlert.copy(
                             id = existingAlert.id,
                             startTime = existingAlert.startTime,
@@ -514,8 +530,12 @@ class TransportDocLevelMonitorFanOutAction
                             acknowledgedTime = existingAlert.acknowledgedTime,
                             findingIds = (existingAlert.findingIds + composedAlert.findingIds).distinct(),
                             relatedDocIds = (existingAlert.relatedDocIds + composedAlert.relatedDocIds).distinct()
+                                .take(MAX_ACCUMULATED_RELATED_DOC_IDS),
+                            aggregationResultBucket = accumulatedAggBucket ?: composedAlert.aggregationResultBucket
                         )
-                    } else composedAlert
+                    } else composedAlert.copy(
+                        relatedDocIds = composedAlert.relatedDocIds.take(MAX_ACCUMULATED_RELATED_DOC_IDS)
+                    )
                     alertsToSave.add(Pair(alert, existingAlert))
                 }
 
@@ -540,9 +560,53 @@ class TransportDocLevelMonitorFanOutAction
                             acknowledgedTime = existingAlert.acknowledgedTime,
                             findingIds = (existingAlert.findingIds + composedAlert.findingIds).distinct(),
                             relatedDocIds = (existingAlert.relatedDocIds + composedAlert.relatedDocIds).distinct()
+                                .take(MAX_ACCUMULATED_RELATED_DOC_IDS)
                         )
-                    } else composedAlert
+                    } else composedAlert.copy(
+                        relatedDocIds = composedAlert.relatedDocIds.take(MAX_ACCUMULATED_RELATED_DOC_IDS)
+                    )
                     alertsToSave.add(Pair(alert, existingAlert))
+                }
+
+                // Complete per-bucket alerts for buckets that had no findings in this execution.
+                // workflowRunContext carries ALL findings across all shards, so bucketToFindings is
+                // the complete active-bucket set regardless of which shard this fan-out handled.
+                // Bucket keys can be any aggregation field value (username, IP, index name, …).
+                // Multiple fan-outs may attempt to complete the same stale alert concurrently; this
+                // is safe because saveAlerts(COMPLETED) is a delete from the active index —
+                // concurrent deletes are idempotent.  existingAlerts may also lag a refresh cycle
+                // and show an alert as ACTIVE after another fan-out already completed it; the
+                // redundant delete is a no-op.
+                // TODO: stale per-bucket alerts are not completed when perRuleFindingIds is empty
+                //   (i.e. the chained monitor fires but no delegate alerts match the findings and
+                //   all findings land in ungroupedFindings).  In that case this block is skipped
+                //   entirely, leaving previously-active per-bucket alerts open until the trigger
+                //   fully clears and completeOpenAlertsIfTriggerCleared picks them up.
+                if (!dryrun && monitor.id != Monitor.NO_ID) {
+                    val activeBucketHashes: Set<String> = bucketToFindings.keys
+                    for ((alertKey, staleAlert) in existingAlerts) {
+                        // The ungrouped fallback alert is keyed by trigger.id alone (no bucket-hash
+                        // suffix).  Its completion is handled by completeOpenAlertsIfTriggerCleared
+                        // at the coordinator level when triggeredDocs.isEmpty().
+                        if (alertKey == trigger.id) continue
+                        if (!alertKey.startsWith("${trigger.id}_")) continue
+                        if (staleAlert.state != Alert.State.ACTIVE && staleAlert.state != Alert.State.ACKNOWLEDGED) continue
+                        val bucketHash = alertKey.removePrefix("${trigger.id}_")
+                        if (bucketHash in activeBucketHashes) continue  // bucket still active
+                        log.info(
+                            "Monitor ${monitor.id} trigger [${trigger.name}]: completing stale " +
+                                "per-bucket alert ${staleAlert.id} (alertKey=$alertKey)"
+                        )
+                        retryPolicy.let {
+                            alertService.saveAlerts(
+                                monitor.dataSources,
+                                listOf(staleAlert.copy(state = Alert.State.COMPLETED, endTime = Instant.now(), errorMessage = null)),
+                                it,
+                                allowUpdatingAcknowledgedAlert = staleAlert.state == Alert.State.ACKNOWLEDGED,
+                                routingId = monitor.id
+                            )
+                        }
+                    }
                 }
 
                 for ((alert, existingAlert) in alertsToSave) {
@@ -597,8 +661,11 @@ class TransportDocLevelMonitorFanOutAction
                         acknowledgedTime = existingAlert.acknowledgedTime,
                         findingIds = (existingAlert.findingIds + composedAlert.findingIds).distinct(),
                         relatedDocIds = (existingAlert.relatedDocIds + composedAlert.relatedDocIds).distinct()
+                            .take(MAX_ACCUMULATED_RELATED_DOC_IDS)
                     )
-                } else composedAlert
+                } else composedAlert.copy(
+                    relatedDocIds = composedAlert.relatedDocIds.take(MAX_ACCUMULATED_RELATED_DOC_IDS)
+                )
                 for (action in trigger.actions) {
                     val actionRunResult = this.runAction(action, triggerCtx.copy(alerts = listOf(AlertContext(alert))), monitor, dryrun)
                     triggerResult.actionResultsMap.getOrPut(alert.id) { mutableMapOf() }
