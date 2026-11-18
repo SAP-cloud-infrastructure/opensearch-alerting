@@ -7,22 +7,21 @@ package org.opensearch.alerting.util
 
 import kotlinx.coroutines.runBlocking
 import org.mockito.ArgumentMatchers.any
-import org.mockito.Mockito
-import org.mockito.Mockito.mock
-import org.opensearch.Version
-import org.opensearch.action.admin.indices.mapping.put.PutMappingRequest
-import org.opensearch.action.support.clustermanager.AcknowledgedResponse
-
 import org.mockito.ArgumentMatchers.anyBoolean
 import org.mockito.ArgumentMatchers.anyString
+import org.mockito.Mockito
 import org.mockito.Mockito.doAnswer
+import org.mockito.Mockito.mock
 import org.mockito.Mockito.`when`
+import org.opensearch.Version
 import org.opensearch.action.admin.indices.create.CreateIndexRequest
 import org.opensearch.action.admin.indices.create.CreateIndexResponse
 import org.opensearch.action.admin.indices.delete.DeleteIndexRequest
+import org.opensearch.action.admin.indices.mapping.put.PutMappingRequest
 import org.opensearch.action.admin.indices.settings.get.GetSettingsRequest
 import org.opensearch.action.admin.indices.settings.get.GetSettingsResponse
 import org.opensearch.action.admin.indices.settings.put.UpdateSettingsRequest
+import org.opensearch.action.support.clustermanager.AcknowledgedResponse
 import org.opensearch.alerting.MonitorRunnerService
 import org.opensearch.alerting.parser
 import org.opensearch.alerting.randomDocumentLevelMonitor
@@ -30,18 +29,16 @@ import org.opensearch.cluster.ClusterName
 import org.opensearch.cluster.ClusterState
 import org.opensearch.cluster.metadata.AliasMetadata
 import org.opensearch.cluster.metadata.IndexMetadata
-import org.opensearch.cluster.metadata.Metadata
-
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver
+import org.opensearch.cluster.metadata.Metadata
 import org.opensearch.cluster.routing.RoutingTable
 import org.opensearch.cluster.service.ClusterService
 import org.opensearch.common.settings.Settings
 import org.opensearch.common.unit.TimeValue
 import org.opensearch.commons.alerting.model.DataSources
-import org.opensearch.commons.alerting.model.Monitor
-
 import org.opensearch.commons.alerting.model.DocLevelMonitorInput
 import org.opensearch.commons.alerting.model.DocLevelQuery
+import org.opensearch.commons.alerting.model.Monitor
 import org.opensearch.commons.alerting.model.MonitorMetadata
 import org.opensearch.commons.alerting.util.AlertingException
 import org.opensearch.core.action.ActionListener
@@ -51,11 +48,9 @@ import org.opensearch.transport.RemoteTransportException
 import org.opensearch.transport.client.AdminClient
 import org.opensearch.transport.client.Client
 import org.opensearch.transport.client.IndicesAdminClient
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.assertFailsWith
 import org.mockito.Mockito.`when` as whenever
-
-
-import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Unit tests for [DocLevelMonitorQueries].
@@ -594,7 +589,9 @@ class DocLevelMonitorQueriesTests : OpenSearchTestCase() {
             putMappingCallCount++
             if (putMappingCallCount == 1) {
                 // Wrap in RemoteTransportException to simulate what OpenSearch sends back over the wire
-                listener.onFailure(RemoteTransportException("field-limit-error", RuntimeException("Limit of total fields [1000] has been exceeded")))
+                listener.onFailure(
+                    RemoteTransportException("field-limit-error", RuntimeException("Limit of total fields [1000] has been exceeded"))
+                )
             } else {
                 listener.onResponse(AcknowledgedResponse(true))
             }
@@ -627,7 +624,7 @@ class DocLevelMonitorQueriesTests : OpenSearchTestCase() {
     }
 
     // putMapping throws a non-field-limit exception with deleteQueryIndexInEveryRun=false — expect AlertingException.
-    fun `test updateQueryIndexMappings when putMapping throws non-field-limit exception and deleteQueryIndexInEveryRun false throws AlertingException`() {
+    fun `test updateQueryIndexMappings non-field-limit failure with deleteQueryIndexInEveryRun false throws AlertingException`() {
         val aliasName = "query-index-alias"
         val monitor = createMonitor(queryIndexAlias = aliasName, deleteQueryIndexInEveryRun = false)
         val sourceIndex = "test-source-index"
@@ -653,7 +650,7 @@ class DocLevelMonitorQueriesTests : OpenSearchTestCase() {
         }.`when`(indicesAdminClient).putMapping(any(PutMappingRequest::class.java), any())
 
         assertFailsWith<AlertingException>(
-            message = "Expected AlertingException when putMapping fails with a non-field-limit error and deleteQueryIndexInEveryRun is false"
+            message = "Expected AlertingException for non-field-limit mapping failure with deleteQueryIndexInEveryRun=false"
         ) {
             runBlocking {
                 testableQueries.updateQueryIndexMappings(
@@ -667,8 +664,6 @@ class DocLevelMonitorQueriesTests : OpenSearchTestCase() {
             }
         }
     }
-
-
 
     // -------------------------------------------------------------------------
     // Helpers
@@ -868,7 +863,6 @@ class DocLevelMonitorQueriesTests : OpenSearchTestCase() {
             isUnrecoverableMappingError(msgPhraseOnly),
         )
     }
-
 
     // leafNodeProcessor alias-skip (Fix 1)
     //

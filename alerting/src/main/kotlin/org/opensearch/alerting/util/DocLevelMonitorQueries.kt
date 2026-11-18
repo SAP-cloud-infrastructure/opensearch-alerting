@@ -855,3 +855,36 @@ open class DocLevelMonitorQueries(private val client: Client, private val cluste
                 )
             }
             if (!updateSettingsResponse.isAcknowledged) {
+                log.warn(
+                    "Field mapping limit settings update was not acknowledged for query index [$concreteQueryIndex]. " +
+                        "The index may still have the old limit of $queryIndexLimit."
+                )
+            }
+        }
+    }
+
+    internal open suspend fun rolloverQueryIndex(monitor: Monitor): String {
+        val queryIndex = monitor.dataSources.queryIndex
+        val queryIndexPattern = monitor.dataSources.queryIndex + INDEX_PATTERN_SUFFIX
+
+        val request = RolloverRequest(queryIndex, null)
+        request.createIndexRequest.index(queryIndexPattern)
+            .mapping(docLevelQueriesMappings())
+            .settings(docLevelQueriesSettings())
+        val response: RolloverResponse = client.suspendUntil {
+            client.admin().indices().rolloverIndex(request, it)
+        }
+        if (response.isRolledOver == false) {
+            val message = "failed to rollover queryIndex:$queryIndex queryIndexPattern:$queryIndexPattern"
+            log.error(message)
+            throw AlertingException.wrap(
+                OpenSearchStatusException(message, RestStatus.INTERNAL_SERVER_ERROR)
+            )
+        }
+        return response.newIndex
+    }
+
+    internal open fun getWriteIndexNameForAlias(alias: String): String? {
+        return this.clusterService.state().metadata().indicesLookup?.get(alias)?.writeIndex?.index?.name
+    }
+}
