@@ -603,7 +603,7 @@ class TransportDocLevelMonitorFanOutAction
                         if (!alertKey.startsWith("${trigger.id}_")) continue
                         if (staleAlert.state != Alert.State.ACTIVE && staleAlert.state != Alert.State.ACKNOWLEDGED) continue
                         val bucketHash = alertKey.removePrefix("${trigger.id}_")
-                        if (bucketHash in activeBucketHashes) continue  // bucket still active
+                        if (bucketHash in activeBucketHashes) continue // bucket still active
                         log.info(
                             "Monitor ${monitor.id} trigger [${trigger.name}]: completing stale " +
                                 "per-bucket alert ${staleAlert.id} (alertKey=$alertKey)"
@@ -629,7 +629,11 @@ class TransportDocLevelMonitorFanOutAction
                     if (!dryrun && monitor.id != Monitor.NO_ID) {
                         val actionResults = triggerResult.actionResultsMap.getOrDefault(alert.id, emptyMap())
                         val actionExecutionResults = actionResults.values.map { actionRunResult ->
-                            ActionExecutionResult(actionRunResult.actionId, actionRunResult.executionTime, if (actionRunResult.throttled) 1 else 0)
+                            ActionExecutionResult(
+                                actionRunResult.actionId,
+                                actionRunResult.executionTime,
+                                if (actionRunResult.throttled) 1 else 0
+                            )
                         }
                         retryPolicy.let {
                             alertService.saveAlerts(
@@ -685,7 +689,11 @@ class TransportDocLevelMonitorFanOutAction
                 if (!dryrun && monitor.id != Monitor.NO_ID) {
                     val actionResults = triggerResult.actionResultsMap.getOrDefault(alert.id, emptyMap())
                     val actionExecutionResults = actionResults.values.map { actionRunResult ->
-                        ActionExecutionResult(actionRunResult.actionId, actionRunResult.executionTime, if (actionRunResult.throttled) 1 else 0)
+                        ActionExecutionResult(
+                            actionRunResult.actionId,
+                            actionRunResult.executionTime,
+                            if (actionRunResult.throttled) 1 else 0
+                        )
                     }
                     retryPolicy.let {
                         alertService.saveAlerts(
