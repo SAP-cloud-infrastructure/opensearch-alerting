@@ -44,6 +44,8 @@ import org.opensearch.commons.alerting.model.ScheduledJob
 import org.opensearch.commons.alerting.util.AlertingException
 import org.opensearch.core.action.ActionListener
 import org.opensearch.core.rest.RestStatus
+import org.opensearch.core.xcontent.DeprecationHandler
+import org.opensearch.core.xcontent.NamedXContentRegistry
 import org.opensearch.index.mapper.MapperService.INDEX_MAPPING_TOTAL_FIELDS_LIMIT_SETTING
 import org.opensearch.index.query.QueryBuilders
 import org.opensearch.index.reindex.BulkByScrollResponse
@@ -131,6 +133,134 @@ open class DocLevelMonitorQueries(private val client: Client, private val cluste
                     }
                 }
             }
+        }
+
+        /** Applies configured overrides recursively, including multifields. */
+        @Suppress("UNCHECKED_CAST")
+        fun applyQueryIndexMappingOverrides(
+            mapping: Map<String, Any>,
+            mappingsByType: Map<String, Map<String, String>>
+        ): MutableMap<String, Any> {
+            val overrides = mappingsByType[mapping[TYPE]] ?: emptyMap()
+            val result = deepCopyMap(mapping)
+            result.putAll(overrides)
+            (result["fields"] as? Map<String, Any>)?.let { fields ->
+                result["fields"] = fields.mapValues { (_, field) ->
+                    applyQueryIndexMappingOverrides(field as Map<String, Any>, mappingsByType)
+                }.toMutableMap()
+            }
+            return result
+        }
+
+        /** Rewrites an exact legacy field token, never an arbitrary dotted prefix. */
+        fun rewriteQueryField(query: String, fieldPath: String, suffix: String): String {
+            return rewriteQueryString(query, mapOf(fieldPath to "$fieldPath$suffix"))
+        }
+
+        /** Native query variants are scoped to the concrete mapping used to compile them. */
+        fun nativeQueryConcreteIndex(
+            hitId: String,
+            monitorId: String,
+            queries: List<DocLevelQuery>,
+            concreteIndices: List<String>
+        ): String? {
+            return concreteIndices.firstOrNull { index ->
+                queries.any { it.query.trimStart().startsWith("{") && hitId == "${it.id}_${index}_$monitorId" }
+            }
+        }
+
+        /** Maps actual multifields to the source leaf whose value indexes them. */
+        @Suppress("UNCHECKED_CAST")
+        fun sourceFieldParents(mapping: Map<String, Any>): Map<String, String> {
+            val parents = mutableMapOf<String, String>()
+            val aliases = mutableMapOf<String, String>()
+            fun visit(fields: Map<String, Any>, prefix: String, parent: String? = null) {
+                fields.forEach { (name, value) ->
+                    val props = value as? Map<String, Any> ?: return@forEach
+                    val path = if (prefix.isEmpty()) name else "$prefix.$name"
+                    if (props[TYPE] == "alias") aliases[path] = props["path"] as String
+                    else if (props[PROPERTIES] is Map<*, *>) visit(props[PROPERTIES] as Map<String, Any>, path)
+                    else {
+                        parents[path] = parent ?: path
+                        (props["fields"] as? Map<String, Any>)?.let { visit(it, path, parent ?: path) }
+                    }
+                }
+            }
+            visit(mapping[PROPERTIES] as? Map<String, Any> ?: emptyMap(), "")
+            aliases.forEach { (alias, target) ->
+                var resolved = target
+                val seen = mutableSetOf(alias)
+                while (aliases.containsKey(resolved) && seen.add(resolved)) resolved = aliases.getValue(resolved)
+                parents[resolved]?.let { parents[alias] = it }
+            }
+            return parents
+        }
+
+        /** Only field tokens outside quoted values are rewritten. */
+        fun rewriteQueryString(query: String, fields: Map<String, String>): String {
+            val out = StringBuilder()
+            var i = 0
+            var quote: Char? = null
+            while (i < query.length) {
+                val c = query[i]
+                if (c == '\\' && i + 1 < query.length) { out.append(c).append(query[i + 1]); i += 2; continue }
+                if (c == '"' || c == '\'') { if (quote == c) quote = null else if (quote == null) quote = c }
+                val fieldBoundary = i == 0 || query[i - 1].isWhitespace() || query[i - 1] in "(+-"
+                if (quote == null && fieldBoundary && (c.isLetterOrDigit() || c == '_' || c == '@')) {
+                    val start = i
+                    while (i < query.length && (query[i].isLetterOrDigit() || query[i] in "_.-@")) i++
+                    val token = query.substring(start, i)
+                    if (i < query.length && query[i] == ':') {
+                        out.append(fields[token] ?: token).append(':'); i++
+                        if (token == "_exists_") {
+                            while (i < query.length && query[i].isWhitespace()) out.append(query[i++])
+                            val valueStart = i
+                            while (i < query.length && (query[i].isLetterOrDigit() || query[i] in "_.-@")) i++
+                            val value = query.substring(valueStart, i)
+                            out.append(fields[value] ?: value)
+                        }
+                    } else out.append(token)
+                } else { out.append(c); i++ }
+            }
+            return out.toString()
+        }
+
+        @Suppress("UNCHECKED_CAST")
+        fun queryForPercolation(query: String, fields: Map<String, String>, defaultFields: List<String>): Map<String, Any> {
+            if (!query.trimStart().startsWith("{")) {
+                return mapOf("query_string" to mapOf("query" to rewriteQueryString(query, fields), "fields" to defaultFields))
+            }
+            val parsed = XContentType.JSON.xContent().createParser(
+                NamedXContentRegistry.EMPTY, DeprecationHandler.THROW_UNSUPPORTED_OPERATION, query
+            ).use { it.map() }
+            fun rewrite(node: Map<String, Any>): Map<String, Any> = node.mapValues { (kind, value) ->
+                when (kind) {
+                    "wildcard", "term", "terms", "match", "match_phrase", "prefix", "regexp", "range", "fuzzy" ->
+                        (value as Map<String, Any>).mapKeys { fields[it.key] ?: it.key }
+                    "exists" -> (value as Map<String, Any>).mapValues { (key, v) -> if (key == "field") fields[v] ?: v else v }
+                    "query_string", "simple_query_string" -> (value as Map<String, Any>).mapValues { (key, v) ->
+                        when (key) {
+                            "query" -> rewriteQueryString(v as String, fields)
+                            "default_field" -> fields[v] ?: v
+                            "fields" -> (v as List<String>).map { field ->
+                                val parts = field.split('^', limit = 2)
+                                (fields[parts[0]] ?: parts[0]) + if (parts.size == 2) "^${parts[1]}" else ""
+                            }
+                            else -> v
+                        }
+                    }
+                    "bool" -> (value as Map<String, Any>).mapValues { (key, v) ->
+                        if (key in setOf("must", "should", "filter", "must_not")) {
+                            if (v is List<*>) v.map { rewrite(it as Map<String, Any>) } else rewrite(v as Map<String, Any>)
+                        } else v
+                    }
+                    "constant_score" -> (value as Map<String, Any>).mapValues { (key, v) ->
+                        if (key == "filter") rewrite(v as Map<String, Any>) else v
+                    }
+                    else -> value
+                }
+            }
+            return rewrite(parsed)
         }
 
         /**
@@ -379,6 +509,7 @@ open class DocLevelMonitorQueries(private val client: Client, private val cluste
             val updatedIndexName = indexName.replace("*", "_")
             val updatedProperties = mutableMapOf<String, Any>()
             val allFlattenPaths = mutableSetOf<Pair<String, String>>()
+            val fieldParentsByIndex = mutableMapOf<String, Map<String, String>>()
             var sourceIndexFieldLimit = 0L
             val conflictingFields = getAllConflictingFields(clusterState, concreteIndices)
 
@@ -386,6 +517,7 @@ open class DocLevelMonitorQueries(private val client: Client, private val cluste
                 if (clusterState.routingTable.hasIndex(concreteIndexName)) {
                     val indexMetadata = clusterState.metadata.index(concreteIndexName)
                     if (indexMetadata.mapping()?.sourceAsMap?.get("properties") != null) {
+                        fieldParentsByIndex[concreteIndexName] = sourceFieldParents(indexMetadata.mapping()!!.sourceAsMap)
                         @Suppress("UNCHECKED_CAST")
                         val properties = deepCopyMap(
                             indexMetadata.mapping()?.sourceAsMap?.get("properties") as Map<String, Any>
@@ -447,6 +579,7 @@ open class DocLevelMonitorQueries(private val client: Client, private val cluste
                     queries,
                     allFlattenPaths,
                     conflictingFields,
+                    fieldParentsByIndex,
                     refreshPolicy,
                     indexTimeout
                 )
@@ -471,13 +604,7 @@ open class DocLevelMonitorQueries(private val client: Client, private val cluste
             fullPath: String,
             props: MutableMap<String, Any>
         ): Triple<String, String, MutableMap<String, Any>> {
-            val newProps = props.toMutableMap()
-            val fieldType = props["type"] as? String
-            if (queryIndexMappingsByType.isNotEmpty() && fieldType != null && queryIndexMappingsByType.containsKey(fieldType)) {
-                queryIndexMappingsByType[fieldType]?.entries?.forEach { iter: Map.Entry<String, String> ->
-                    newProps[iter.key] = iter.value
-                }
-            }
+            val newProps = applyQueryIndexMappingOverrides(props, queryIndexMappingsByType)
             val fieldSuffix = if (conflictingFields.contains(fullPath)) concreteIndexName else updatedIndexName
             if (props.containsKey("path")) {
                 val targetPath = props["path"] as? String
@@ -497,6 +624,7 @@ open class DocLevelMonitorQueries(private val client: Client, private val cluste
         queries: List<DocLevelQuery>,
         flattenPaths: MutableSet<Pair<String, String>>,
         conflictingPaths: Set<String>,
+        fieldParentsByIndex: Map<String, Map<String, String>>,
         refreshPolicy: RefreshPolicy,
         indexTimeout: TimeValue
     ) {
@@ -517,13 +645,31 @@ open class DocLevelMonitorQueries(private val client: Client, private val cluste
         }
 
         val newQueries = mutableListOf<DocLevelQuery>()
+        val queriesById = mutableMapOf<String, Map<String, Any>>()
         queries.forEach {
+            if (it.query.trimStart().startsWith("{")) {
+                // Each backing index can have different scalar/object/multifield shapes.
+                fieldParentsByIndex.forEach { (concreteIndex, parents) ->
+                    val renamed = parents.mapValues { (field, parent) ->
+                        val index = if (conflictingPaths.contains(parent)) concreteIndex else sourceIndex
+                        "${parent}_${index}_$monitorId${field.removePrefix(parent).takeIf { field.startsWith(parent) } ?: ""}"
+                    }
+                    val newQuery = it.copy(id = "${it.id}_$concreteIndex")
+                    newQueries.add(newQuery)
+                    queriesById[newQuery.id] = queryForPercolation(it.query, renamed, it.fields)
+                }
+                return@forEach
+            }
             val filteredConcreteIndices = mutableSetOf<String>()
             var query = it.query
             conflictingPaths.forEach { conflictingPath ->
                 if (query.contains(conflictingPath)) {
-                    query = transformExistsQuery(query, conflictingPath, "<index>", monitorId)
-                    query = query.replace("$conflictingPath:", "${conflictingPath}_<index>_$monitorId:")
+                    val fields = fieldParentsByIndex.values.flatMap { it.entries }.filter { it.value == conflictingPath }
+                        .associate { entry ->
+                            val subfield = if (entry.key.startsWith("$conflictingPath.")) entry.key.removePrefix(conflictingPath) else ""
+                            entry.key to "${conflictingPath}_<index>_$monitorId$subfield"
+                        }
+                    query = rewriteQueryString(query, fields)
                     filteredConcreteIndices.addAll(conflictingPathToConcreteIndices[conflictingPath]!!)
                 }
             }
@@ -545,15 +691,19 @@ open class DocLevelMonitorQueries(private val client: Client, private val cluste
             var query = it.query
             flattenPaths.forEach { fieldPath ->
                 if (!conflictingPaths.contains(fieldPath.first)) {
-                    query = transformExistsQuery(query, fieldPath.first, sourceIndex, monitorId)
-                    query = query.replace("${fieldPath.first}:", "${fieldPath.first}_${sourceIndex}_$monitorId:")
+                    val fields = fieldParentsByIndex.values.flatMap { it.entries }.filter { it.value == fieldPath.first }
+                        .associate { entry ->
+                            val subfield = if (entry.key.startsWith("${fieldPath.first}.")) entry.key.removePrefix(fieldPath.first) else ""
+                            entry.key to "${fieldPath.first}_${sourceIndex}_$monitorId$subfield"
+                        }
+                    query = rewriteQueryString(query, fields)
                 }
             }
             val indexRequest = IndexRequest(concreteQueryIndex)
                 .id(it.id + "_$monitorId")
                 .source(
                     mapOf(
-                        "query" to mapOf("query_string" to mapOf("query" to query, "fields" to it.fields)),
+                        "query" to (queriesById[it.id] ?: mapOf("query_string" to mapOf("query" to query, "fields" to it.fields))),
                         "monitor_id" to monitorId,
                         "index" to sourceIndex
                     )
