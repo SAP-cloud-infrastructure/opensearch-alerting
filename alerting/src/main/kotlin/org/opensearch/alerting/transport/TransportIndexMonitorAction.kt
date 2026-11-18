@@ -753,7 +753,9 @@ class TransportIndexMonitorAction @Inject constructor(
                             if (cause is IndexNotFoundException ||
                                 cause is SearchPhaseExecutionException
                             ) {
-                                log.info("$SCHEDULED_JOBS_INDEX index not available for monitor count validation, proceeding with indexing.")
+                                log.info(
+                                    "$SCHEDULED_JOBS_INDEX index not available for monitor count validation, proceeding with indexing."
+                                )
                                 scope.launch(TenantContext(tenantId)) {
                                     indexMonitor()
                                 }
